@@ -70,6 +70,9 @@ body.menu-open #corner, body.menu-open .hud, body.menu-open #tip { display: none
 #cross { position: fixed; left: 50%; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; border: 2px solid rgba(243, 239, 230, 0.85);
 	box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); pointer-events: none; z-index: 5; }
 
+#cross.dot { width: 6px; height: 6px; margin: -3px 0 0 -3px; background: rgba(243, 239, 230, 0.9); border-width: 1px; }
+#cross.dot.on { background: #ffe640; border-color: #ffe640; box-shadow: 0 0 10px 3px rgba(255, 230, 64, 0.6); }
+
 /* ---- the send */
 #sent { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; z-index: 30; }
 #sent .card { pointer-events: auto; text-align: center; padding: 22px 26px; display: grid; gap: 10px; min-width: min(340px, 90vw); animation: rise 0.35s ease-out; }

@@ -32,6 +32,18 @@ export function handOn(frame, contact, over, side, grip, shake = 0) {
 	return { end: palm.sub(over.mul(5.5)).add(frame.out.mul(0.8)), hand: { palm, over, out: frame.out, thumb, grip } };
 }
 
+// push a point out of the wall it sits near, so a limb or the eyes never poke through a panel. Min is the clearance in centimeters
+export function awayFromWall(face, p, min) {
+	let out = p;
+	for (const panel of face.panels) {
+		const along = p.sub(panel.origin).dot(panel.up) / 100 + panel.start;
+		if (along < panel.start - 0.15 || along > panel.start + panel.length + 0.15) continue;
+		const depth = out.sub(panel.origin).dot(panel.out);
+		if (depth < min && depth > -60) out = out.add(panel.out.mul(min - depth));
+	}
+	return out;
+}
+
 // elbows and knees: a two-bone bend toward each limb's pole, at the real limb length
 export function solve(pose) {
 	pose.limbs.forEach((limb, index) => {
@@ -124,13 +136,15 @@ export class Climber {
 		// the boxy tee: rings of a rounded box from the collar to the hem, rebuilt every frame so it can sway
 		const rings = 5, around = Around;
 		const shirt = new THREE.BufferGeometry();
-		shirt.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(rings * around * 3), 3));
+		shirt.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array((rings * around + 1) * 3), 3));
 		const index = [];
 		for (let r = 0; r + 1 < rings; r++)
 			for (let a = 0; a < around; a++) {
 				const i = r * around + a, j = r * around + (a + 1) % around;
 				index.push(i, i + around, j, j, i + around, j + around);
 			}
+		// the collar is closed by a flat cap, so looking down at your own chest does not look down the inside of the tee
+		for (let a = 0; a < around; a++) index.push(rings * around, (a + 1) % around, a);
 		shirt.setIndex(index);
 		// the outfit's three colors live on these materials, so a change in the settings shows at once
 		this.cloth = {
@@ -160,11 +174,30 @@ export class Climber {
 				palm: arm ? this.ball(Skin) : null, fingers: arm ? Array.from({ length: 5 }, () => new Tube(this.group, skin, 7, 8)) : [],
 				shoe: arm ? null : new Tube(this.group, this.cloth.shoes, 12, 14), sole: arm ? null : new Tube(this.group, sole, 12, 10) };
 		});
+		// in first person the head is swapped for a material that draws nothing, so the camera sits inside it but its shadow stays on the wall
+		this.ghost = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false });
+		this.headParts = [this.neck, this.head, this.hair, this.beard, this.nose, ...this.ears];
+		this.headPaint = this.headParts.map(m => m.material);
 		this.marker = new THREE.Mesh(new THREE.SphereGeometry(0.12, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffe640, wireframe: true, transparent: true, opacity: 0.8 }));
 		this.group.add(this.marker);
 		this.clock = 0;
+		this.away = 0;
 		this.drawn = 0;
 		this.reset();
+	}
+
+	// the camera is behind the eyes: hide the head parts, or give them back
+	setFirstPerson(on) {
+		if (this.inside === on) return;
+		this.inside = on;
+		this.headParts.forEach((m, i) => { m.material = on ? this.ghost : this.headPaint[i]; });
+		// the key light sits over the camera's shoulder, so your own shadow would cover everything you look at
+		this.casting ??= new Map();
+		this.group.traverse((m) => {
+			if (!m.isMesh) return;
+			if (!this.casting.has(m)) this.casting.set(m, m.castShadow);
+			m.castShadow = on ? false : this.casting.get(m);
+		});
 	}
 
 	// forget the eased body shape, for a fresh start on the wall
@@ -253,8 +286,9 @@ export class Climber {
 		const hangs = [2, 3].filter(on).filter(l => sim.grips[l] >= 0).map(l => sim.distance(l, sim.tips[l]) / (sim.body.lengths[l] * 2));
 		const straight = hangs.length ? clamp((Math.max(...hangs) - 0.75) / 0.2, 0, 1) : 0;
 		const steep = Math.max(0, face.steep(sim.position.y));
-		this.hips += (16 + 22 * compress + 10 * steep * straight - this.hips) * ease;
-		this.chestDepth += (20 + 10 * straight + 6 * steep - this.chestDepth) * ease;
+		// in first person the body hangs further off the wall, as it does in life, so looking down shows the legs past the chest
+		this.hips += (16 + 22 * compress + 10 * steep * straight + 22 * this.away - this.hips) * ease;
+		this.chestDepth += (20 + 10 * straight + 6 * steep + 18 * this.away - this.chestDepth) * ease;
 		const roots = [0, 1, 2, 3].map(l => at(sim.joint(l), l < 2 ? this.hips - 10 * this.turn * sideOf(l) : this.chestDepth - 5 * this.turn * sideOf(l)));
 		const pelvis = mid(roots[0], roots[1]), chest = mid(roots[2], roots[3]);
 		const up = chest.sub(pelvis).norm();
@@ -306,13 +340,16 @@ export class Climber {
 				part = { end: ankle, foot: { toe: contact, heel, up: panel.up } };
 			}
 			// elbows drop down and out, knees splay out and lead upward. a foot on the side the body is turning toward drops its knee
-			const lean = arm ? [0.6, side * 0.5, -0.6] : [0.35, side * 0.3, 1];
+			const lean = arm ? [0.6, side * 0.5, -0.6] : [0.35, side * (0.3 + 0.9 * this.away), 1];
 			let pole = frame.out.mul(lean[0]).add(frame.right.mul(lean[1])).add(frame.up.mul(lean[2]));
 			if (!arm && held) pole = pole.lerp(frame.up.mul(-1).add(frame.right.mul(-side * 0.7)).add(frame.out.mul(0.3)), clamp(this.turn * side, 0, 1) * 0.85);
 			limbs.push({ ...part, pole });
 			if (limb === selected) marker = contact;
 		}
-		return solve({ roots, up, back: frame.out, head, look: this.look, limbs, marker });
+		const posed = solve({ roots, up, back: frame.out, head, look: this.look, limbs, marker });
+		// elbows and knees stay out of the wall, so the arms and legs never sink into it
+		posed.limbs.forEach((l, i) => { if (l.bend) l.bend = awayFromWall(face, l.bend, i < 2 ? 11 : 7.5); });
+		return posed;
 	}
 
 	// the tee as five rounded-box rings, the hem hanging off a spring: it drapes toward the floor, lags behind the hips, and rides up when the arms go overhead
@@ -353,6 +390,7 @@ export class Climber {
 				positions.setXYZ(r * Around + a, ...toThree(point));
 			}
 		});
+		positions.setXYZ(rings.length * Around, ...toThree(rings[0][0]));
 		positions.needsUpdate = true;
 		this.shirt.geometry.computeVertexNormals();
 	}

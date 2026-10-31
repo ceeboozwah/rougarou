@@ -4,7 +4,7 @@
 import * as THREE from 'three';
 import { Sim, Vec2, Vec3, Names } from './sim.js';
 import { problems, buildGym, routeHolds, toThree, Overview, Focus, tape } from './gym.js';
-import { Climber, walkPose, blend, handOn, solve } from './climber.js';
+import { Climber, walkPose, blend, handOn, solve, awayFromWall } from './climber.js';
 import { Ragdoll } from './ragdoll.js';
 import { World, floorAt } from './world.js';
 import { Audio } from './audio.js';
@@ -271,6 +271,86 @@ let note = '', noted = 0;
 let started = 0, finished = 0;
 // what the last frame saw, to hear and see catches, slips and landings
 let latched = [1, 1, 1, 1], gripped = [0, 1, 2, 3], landed = false, stride = 0;
+
+// ---------------------------------------------------------------- first person
+
+// v puts the camera behind the climber's eyes. the view turns with the mouse in the wall's own frame (yaw across, pitch up),
+// the hold under the crosshair glows, and a side key (r or l) then a limb key (a for arm, l for leg) sends that limb to it
+const fp = { lean: new Vec2(), want: false, k: 0, yaw: 0, pitch: 0.2, F: null, U: null, eye: null, hold: -1, side: '', at: 0 };
+const fpOn = () => fp.want && mode === 'climb';
+const SIDE_WAIT = 1600;
+const glow = (() => {
+	const paper = document.createElement('canvas');
+	paper.width = paper.height = 128;
+	const g = paper.getContext('2d');
+	const ring = g.createRadialGradient(64, 64, 8, 64, 64, 62);
+	ring.addColorStop(0, 'rgba(255, 230, 64, 0.0)');
+	ring.addColorStop(0.55, 'rgba(255, 230, 64, 0.1)');
+	ring.addColorStop(0.78, 'rgba(255, 226, 90, 0.6)');
+	ring.addColorStop(1, 'rgba(255, 230, 64, 0)');
+	g.fillStyle = ring;
+	g.fillRect(0, 0, 128, 128);
+	const map = new THREE.CanvasTexture(paper);
+	const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map, transparent: true, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending }));
+	sprite.renderOrder = 10;
+	sprite.visible = false;
+	scene.add(sprite);
+	return sprite;
+})();
+
+function toggleFirstPerson() {
+	if (!fp.want && mode !== 'climb') return;
+	fp.want = !fp.want;
+	fp.side = '';
+	fp.lean = new Vec2();
+	if (fp.want) {
+		fp.yaw = 0;
+		fp.pitch = 0.2;
+		$('tip').classList.add('gone');
+		canvas.requestPointerLock?.()?.catch?.(() => {});
+		ui.toast('first person: look at a hold, then r or l and a (arm) or l (leg)', 'good');
+	} else if (document.pointerLockElement) document.exitPointerLock();
+}
+
+// turn the first person view; the pitch stops short of straight up and down
+function fpLook(dx, dy) {
+	fp.yaw = clamp(fp.yaw + dx, -2.8, 2.8);
+	fp.pitch = clamp(fp.pitch - dy, -1.4, 1.4);
+}
+
+// the hold nearest the middle of the screen, as the closest to the line of sight in centimeters (relative to how big a target it is at that range)
+function holdInSight() {
+	const face = routes[sim.route];
+	const eye = unreal(camera.position), dir = unreal(camera.getWorldDirection(new THREE.Vector3())).norm();
+	let best = -1, score = 1;
+	sim.holds().forEach((h, i) => {
+		const v = face.map(h.point, 6).sub(eye), along = v.dot(dir);
+		if (along < 20 || along > 400) return;
+		const off = v.sub(dir.mul(along)).len() / Math.max(10, 0.08 * along);
+		if (off < score) { score = off; best = i; }
+	});
+	return best;
+}
+
+// send a hand or foot to the hold in the crosshair
+function sendLimb(l) {
+	if (mode !== 'climb') return;
+	fp.side = '';
+	if (fp.hold < 0) { ui.toast('look at a hold first', 'warn'); return; }
+	limb = -1;
+	if (!sim.grab(l, fp.hold)) ui.toast(sim.hint, 'warn');
+}
+
+// the two-key pick: r or l, then a (arm) or l (leg). true when the key belonged to it
+function limbKey(k) {
+	const now = performance.now();
+	if (fp.side && now - fp.at > SIDE_WAIT) fp.side = '';
+	if (k === 'r' || (k === 'l' && !fp.side)) { fp.side = k; fp.at = now; return true; }
+	if (!fp.side || (k !== 'a' && k !== 'l')) { if (k !== 'shift') fp.side = ''; return false; }
+	const right = fp.side === 'r';
+	sendLimb(k === 'a' ? (right ? 2 : 3) : (right ? 0 : 1));
+	return true;
+}
 
 // ---------------------------------------------------------------- controls
 
@@ -567,6 +647,12 @@ canvas.addEventListener('pointerdown', (e) => {
 		return;
 	}
 	if (mode !== 'climb') return;
+	if (fpOn()) {
+		// first person: a click takes the mouse for looking, or a drag looks when the pointer is not locked
+		if (e.pointerType === 'mouse' && document.pointerLockElement !== canvas) canvas.requestPointerLock?.()?.catch?.(() => {});
+		if (!looking) looking = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
+		return;
+	}
 	if (e.button === 2) { cancel(); return; }
 	if (limb >= 0) { place(); return; }
 	const found = pick(e.clientX, e.clientY);
@@ -580,6 +666,7 @@ canvas.addEventListener('pointerdown', (e) => {
 });
 canvas.addEventListener('pointermove', (e) => {
 	if (document.pointerLockElement === canvas) {
+		if (fpOn()) { fpLook(e.movementX * 0.0025 * ui.settings.look, e.movementY * 0.002 * ui.settings.look); return; }
 		camYaw += e.movementX * 0.0025 * ui.settings.look;
 		camPitch = clamp(camPitch - e.movementY * 0.002 * ui.settings.look, -0.85, 0.3);
 		return;
@@ -595,8 +682,8 @@ canvas.addEventListener('pointermove', (e) => {
 	if (looking && e.pointerId === looking.id) {
 		const dx = e.clientX - looking.x, dy = e.clientY - looking.y;
 		if (Math.abs(dx) + Math.abs(dy) > 3) looking.moved = looking.moved || Math.hypot(e.clientX - looking.x, e.clientY - looking.y) > 3;
-		camYaw += dx * 0.006 * ui.settings.look;
-		camPitch = clamp(camPitch - dy * 0.004 * ui.settings.look, -0.85, 0.3);
+		if (fpOn()) fpLook(dx * 0.006 * ui.settings.look, dy * 0.004 * ui.settings.look);
+		else { camYaw += dx * 0.006 * ui.settings.look; camPitch = clamp(camPitch - dy * 0.004 * ui.settings.look, -0.85, 0.3); }
 		looking.x = e.clientX;
 		looking.y = e.clientY;
 	}
@@ -629,6 +716,21 @@ addEventListener('keydown', (e) => {
 	if (e.code === 'Backquote') { recorder.toggle(); return; }
 	if (k === 'm' || (k === 'escape' && limb < 0 && mode !== 'edit')) { ui.toggle(); return; }
 	if (ui.open || recorder.view) return;
+	if (k === 'v' && !e.repeat) { toggleFirstPerson(); return; }
+	if (fpOn() && !e.ctrlKey && !e.metaKey) {
+		// hips: an arrow key latches that shift until it is pressed again (or space centers them), so wasd is free for picking limbs
+		const dir = { arrowleft: [1, 0], arrowright: [-1, 0], arrowup: [0, 1], arrowdown: [0, -1] }[k];
+		if (dir || k === ' ') {
+			e.preventDefault();
+			if (e.repeat) return;
+			if (k === ' ') fp.lean = new Vec2();
+			else if (dir[0]) fp.lean.x = fp.lean.x === dir[0] ? 0 : dir[0];
+			else fp.lean.y = fp.lean.y === dir[1] ? 0 : dir[1];
+			return;
+		}
+		if (e.repeat && (k === 'r' || k === 'l' || k === 'a')) return;
+		if (limbKey(k)) { keys.delete(k); return; }
+	}
 	keys.add(k);
 	if (mode === 'edit') {
 		if (k === 'q' || k === 'arrowleft') editor.turn(15);
@@ -638,13 +740,13 @@ addEventListener('keydown', (e) => {
 		if (k === 'escape' || k === 'enter') finishEdit();
 		return;
 	}
-	if (k === 'r') retry();
+	if (k === 'r' && !fpOn()) retry();
 	if (k === ']') visit(1);
 	if (k === '[') visit(-1);
 	if (k === 'g') wide = !wide;
 	if (k === 'e') pullOn();
 	if (k === 'j') jumpDown();
-	if (k === 'escape') cancel();
+	if (k === 'escape') { cancel(); fp.side = ''; }
 	if (k === 'x') letGo();
 });
 addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
@@ -661,6 +763,11 @@ $('drop').onclick = jumpDown;
 $('again').onclick = retry;
 $('onward').onclick = jumpDown;
 $('nextUp').onclick = () => goTo((sim.route + 1) % routes.length, true);
+$('fpBtn').onclick = toggleFirstPerson;
+$('fpRH').onclick = () => sendLimb(2);
+$('fpLH').onclick = () => sendLimb(3);
+$('fpRF').onclick = () => sendLimb(0);
+$('fpLF').onclick = () => sendLimb(1);
 $('menuBtn').onclick = () => ui.toggle();
 $('eKind').onclick = () => editor.kind();
 $('eLeft').onclick = () => editor.turn(15);
@@ -754,7 +861,7 @@ function climb(delta) {
 	sim.reaching = limb;
 	sim.target = point && limb >= 0 ? point : aim;
 	// wasd or the thumbstick drag shifts the hips; the camera sits behind the climber, so screen right is sim -x
-	let lean = new Vec2((keys.has('a') ? 1 : 0) - (keys.has('d') ? 1 : 0), (keys.has('w') ? 1 : 0) - (keys.has('s') ? 1 : 0));
+	let lean = fpOn() ? fp.lean.copy() : new Vec2((keys.has('a') ? 1 : 0) - (keys.has('d') ? 1 : 0), (keys.has('w') ? 1 : 0) - (keys.has('s') ? 1 : 0));
 	if (joystick) lean = lean.add(new Vec2(-joystick.dx / 70, -joystick.dy / 70)).clampLen(1);
 	sim.lean = lean.mul(0.6);
 	banked = Math.min(banked + delta, 0.25);
@@ -777,12 +884,14 @@ function climb(delta) {
 
 // ---------------------------------------------------------------- the loop
 
+let baseFov = 50;
 function resize() {
 	const w = innerWidth, h = innerHeight;
 	renderer.setSize(w, h, false);
 	camera.aspect = w / h;
 	// keep the unreal camera's 55 degree horizontal view in landscape; a tall phone gets a taller view instead
-	camera.fov = camera.aspect >= 1 ? THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(27.5)) / camera.aspect)) : 64;
+	baseFov = camera.aspect >= 1 ? THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(27.5)) / camera.aspect)) : 64;
+	camera.fov = baseFov;
 	camera.updateProjectionMatrix();
 }
 addEventListener('resize', resize);
@@ -865,8 +974,43 @@ function update(real) {
 	}
 	view = view.lerp(goal, Math.min(1, delta * speed));
 	look = look.lerp(target, Math.min(1, delta * speed * 2));
-	camera.position.copy(three(view));
-	camera.lookAt(three(look));
+	// first person blends in from the third person camera and out again, and when fully in the camera is the eye itself
+	fp.k = clamp(fp.k + (fpOn() ? delta : -delta) / 0.45, 0, 1);
+	if (fp.k > 0) {
+		const panel = face.at(sim.position.y);
+		fp.F = fp.F ? fp.F.lerp(panel.out.mul(-1), Math.min(1, delta * 6)).norm() : panel.out.mul(-1);
+		fp.U = fp.U ? fp.U.lerp(panel.up, Math.min(1, delta * 6)).norm() : panel.up;
+		const F = fp.F, U = fp.U.sub(F.mul(fp.U.dot(F))).norm(), R = U.cross(F), cp = Math.cos(fp.pitch);
+		const dir = F.mul(cp * Math.cos(fp.yaw)).add(R.mul(cp * Math.sin(fp.yaw))).add(U.mul(Math.sin(fp.pitch)));
+		// the eyes sit at the head and never nearer the wall than about a hand's length
+		const eye = awayFromWall(face, pose.head.add(F.mul(12)).add(U.mul(2)), 18);
+		fp.eye = awayFromWall(face, fp.eye ? fp.eye.lerp(eye, Math.min(1, delta * 30)) : eye, 18);
+		const t = ease(fp.k);
+		camera.position.copy(three(view.lerp(fp.eye, t)));
+		camera.up.copy(new THREE.Vector3(0, 1, 0).lerp(three(U).normalize(), t).normalize());
+		camera.lookAt(three(look.lerp(fp.eye.add(dir.mul(100)), t)));
+		camera.fov = baseFov + ((camera.aspect >= 1 ? 80 : 90) - baseFov) * t;
+		camera.near = fp.k > 0.5 ? 0.03 : 0.05;
+		camera.updateProjectionMatrix();
+	} else {
+		fp.F = fp.U = fp.eye = null;
+		camera.up.set(0, 1, 0);
+		camera.position.copy(three(view));
+		camera.lookAt(three(look));
+		if (camera.near !== 0.05 || camera.fov !== baseFov) { camera.fov = baseFov; camera.near = 0.05; camera.updateProjectionMatrix(); }
+	}
+	climber.setFirstPerson(fp.k > 0.5);
+	climber.away = fp.k;
+	// the hold in the crosshair glows
+	camera.updateMatrixWorld();
+	fp.hold = fp.k > 0.9 && fpOn() ? holdInSight() : -1;
+	glow.visible = fp.hold >= 0;
+	if (glow.visible) {
+		const at = face.map(sim.holds()[fp.hold].point, 8);
+		glow.position.copy(three(at));
+		glow.scale.setScalar(Math.max(0.3, at.dist(unreal(camera.position)) * 0.0012) * (1 + 0.07 * Math.sin(climber.clock * 6)));
+		glow.material.opacity = 0.6 + 0.2 * Math.sin(climber.clock * 6);
+	}
 	const center = three(pelvis);
 	key.target.position.copy(center);
 	key.position.copy(center).addScaledVector(keyDirection, -15);
@@ -899,6 +1043,8 @@ function update(real) {
 	let status;
 	if (mode === 'edit') status = editor.hold ? `${editor.label(editor.selected)}: drag to move, q and e or the arrows turn it` : 'pick a hold to move it. green are the starts, red the finish';
 	else if (mode === 'fall') status = note;
+	else if (fpOn() && fp.side && performance.now() - fp.at < SIDE_WAIT) status = `${fp.side === 'r' ? 'right' : 'left'}: a for the arm, l for the leg`;
+	else if (fpOn() && fp.hold >= 0 && limb < 0 && !sim.latch.some(v => v < 0)) status = `${sim.holds()[fp.hold].kind}: r or l, then a (arm) or l (leg)`;
 	else if (climbing) status = limb >= 0 ? `${Names[limb]} off the wall` : sliding ? 'fingers sliding: get your feet under you' : sim.topped > 0 && !sim.won ? 'matched the top, hold it...' : (sim.hint || 'pick a hand or foot');
 	else if (note && noted < 4) status = note;
 	else if (near) {
@@ -917,14 +1063,21 @@ function update(real) {
 	show('hang', mode === 'climb' && limb >= 0);
 	show('drop', mode === 'climb' && limb < 0);
 	show('retry', mode === 'climb' || mode === 'fall');
+	show('fpBtn', mode === 'climb');
+	$('fpBtn').textContent = fp.want ? 'third person' : 'first person';
+	for (const id of ['fpRH', 'fpLH', 'fpRF', 'fpLF']) show(id, fpOn());
 	show('pull', mode === 'walk' && !!near);
 	show('edit', mode === 'walk' && !!near && !touchy);
 	show('prev', mode === 'walk');
 	show('next', mode === 'walk');
 	const locked = document.pointerLockElement === canvas;
-	$('cross').hidden = !(locked && mode === 'walk');
+	const inside = fp.k > 0.5 && fpOn();
+	$('cross').hidden = !(locked && mode === 'walk') && !inside;
+	$('cross').classList.toggle('dot', inside);
+	$('cross').classList.toggle('on', fp.hold >= 0);
 	$('keys').textContent = mode === 'edit' ? 'drag a hold · q e turn · t kind · delete removes · wheel turns · enter done'
-		: climbing ? 'wasd hips · esc put back · x hang · j jump down · r retry · wheel zoom · m menu · ` record'
+		: fpOn() ? 'mouse looks · r/l then a arm or l leg · arrows latch hips, space centers · x hang · j jump down · v third person · m menu'
+		: climbing ? 'v first person · wasd hips · esc put back · x hang · j jump down · r retry · wheel zoom · m menu · ` record'
 		: locked ? 'wasd walk · shift jog · mouse looks · click a start hold · e pull on · esc frees the mouse'
 		: 'wasd walk · shift jog · click to look around · wheel zoom · e pull on · [ ] next · m menu · ` record';
 	if (mode === 'mount' && !$('tip').classList.contains('gone') && $('tip').textContent !== climbTip) $('tip').textContent = climbTip;
@@ -936,6 +1089,6 @@ else { walker.near = -1; pose = walkerPose(); }
 $('loading').remove();
 requestAnimationFrame(frame);
 // a handle for poking at the game from the console
-window.rougarou = { sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
+window.rougarou = { camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
 	// run the game forward without waiting on the browser's frame clock
 	tick: (seconds) => { for (let t = 0; t < seconds; t += 1 / 60) update(1 / 60); } };
