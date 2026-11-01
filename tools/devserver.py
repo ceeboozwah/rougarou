@@ -52,6 +52,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         try:
             data = self.body()
             limits = data['limits']
+            mix = data.get('mix')
+            if mix is not None:
+                assert isinstance(mix, dict) and len(mix) <= 12 and all(re.fullmatch(r'[a-z0-9]{2,12}', k) and isinstance(v, (int, float)) and 0 <= v <= 1 for k, v in mix.items())
             assert isinstance(limits, dict) and len(limits) < 200
             for name, entry in limits.items():
                 assert re.fullmatch(r'[LR]?_?[A-Za-z0-9]{2,20}', name)
@@ -65,12 +68,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self.reply(400, {'error': 'that is not a set of joint limits'})
         path = os.path.join(ROOT, 'limits.json')
         os.makedirs(os.path.join(CACHE, 'limit-backups'), exist_ok=True)
+        if mix is None and os.path.exists(path):
+            try:
+                with open(path) as f: mix = json.load(f).get('mix')
+            except Exception:
+                mix = None
         if os.path.exists(path):
             import shutil, time
             shutil.copy(path, os.path.join(CACHE, 'limit-backups', f'limits-{int(time.time())}.json'))
         lines = ',\n'.join(f'  {json.dumps(k)}: {json.dumps(limits[k], separators=(",", ":"))}' for k in sorted(limits))
         with open(path + '.tmp', 'w') as f:
-            f.write('{"version": 1, "limits": {\n' + lines + '\n}}\n')
+            f.write('{"version": 1, ' + (f'"mix": {json.dumps(mix, separators=(",", ":"))}, ' if mix else '') + '"limits": {\n' + lines + '\n}}\n')
         os.replace(path + '.tmp', path)
         return self.reply(200, {'ok': True, 'joints': len(limits)})
 

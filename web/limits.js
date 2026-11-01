@@ -104,27 +104,43 @@ export function clampRel(rel, frame, lim) {
 	return { q: arc(frame.T, T2).multiply(new Q().setFromAxisAngle(frame.T, twist / frame.side / DEG)), hit: true, values: m };
 }
 
-// plausible human limits to start from, for each kind of joint (a left and a right bone have the same numbers); the fingers and toes are left free
-const Human = {
-	Waist: { fwd: 40, back: 25, out: 25, inn: 25, twist: [-30, 30] },
-	Spine01: { fwd: 30, back: 20, out: 20, inn: 20, twist: [-25, 25] },
-	Spine02: { fwd: 25, back: 15, out: 15, inn: 15, twist: [-25, 25] },
-	NeckTwist01: { fwd: 45, back: 35, out: 30, inn: 30, twist: [-45, 45] },
-	NeckTwist02: { fwd: 30, back: 25, out: 25, inn: 25, twist: [-45, 45] },
-	Head: { fwd: 40, back: 40, out: 35, inn: 35, twist: [-50, 50] },
-	Clavicle: { fwd: 25, back: 25, out: 30, inn: 15, twist: [-20, 20] },
-	Upperarm: { fwd: 178, back: 70, out: 175, inn: 60, twist: [-90, 95] },
-	Forearm: { fwd: 155, back: 8, out: 8, inn: 8, twist: [-85, 85] },
-	Hand: { fwd: 90, back: 90, out: 40, inn: 40, twist: [-50, 50] },
-	Thigh: { fwd: 130, back: 35, out: 95, inn: 50, twist: [-70, 70] },
-	Calf: { fwd: 8, back: 155, out: 8, inn: 8, twist: [-30, 30] },
-	Foot: { fwd: 35, back: 55, out: 35, inn: 35, twist: [-30, 30] },
+// the anatomical ranges of a person, joint by joint: the hard walls the characters obey. they are measured from THIS skeleton's rest pose (the arms rest in an
+// A-pose, 58 degrees out from the sides; the legs hang straight; the spine stands), in the four swing directions and the twist of jointFrame, so the numbers
+// below are not the textbook angles but the textbook angles turned into those frames. the sources (adult ranges of motion, active and passive):
+//   AAOS and Norkin and White, Measurement of Joint Motion; Kapandji, The Physiology of the Joints; Gunn et al. and White and Panjabi on the spine;
+//   Boone and Azen 1979 (normal ROM of 109 men); Soucie 2011 (ROM of 1,000+ adults); Mouton on climbers' hip and knee flexibility.
+//   hip: flexion 120 (135 with the knee bent, 150 with the pelvis tilting under it as it does in a high step), extension 20 (30 in a drop knee), abduction 45-50 (a climber's stem or frog 70-80),
+//        adduction 30, rotation 45 out and 35 in (50 with the hip flexed)
+//   knee: flexion 135 active, 150-160 passive (heel to buttock), hyperextension 0-5, no side bend (5), axial rotation 5 near straight, 30-45 at 90 degrees
+//   ankle: dorsiflexion 20 (30 with the knee bent), plantarflexion 50 (55 on the toe), inversion 35, eversion 15
+//   shoulder (glenohumeral plus the shoulder blade): flexion 180, extension 60, abduction 180, adduction 30 (140 across the chest), rotation 90 out and 70 in
+//   elbow: flexion 145-150, hyperextension 0-5, forearm roll 80 each way (pronation 80, supination 80-90)
+//   wrist: flexion 80, extension 70, radial deviation 20, ulnar deviation 30
+//   neck: flexion 45-60, extension 60-85, side bend 40-45 each way, rotation 80-90 each way; half of the rotation is the top joint (C1-C2)
+//   lumbar spine: flexion 40-60, extension 25-35, side bend 20 each way, rotation only 5 each way; thoracic: flexion 30-40, extension 20-25, side bend 25 each way,
+//        rotation 30-35 each way; the whole trunk about 80 forward, 30 back, 35 to the side, 45 to turn
+// the spine and neck are split over their joints the way the real column shares them (the lumbar bends and the thoracic turns; the top neck joint does half of
+// the turning). the 'out' of an arm is up (the arm is raised from the A-pose, 122 degrees to straight overhead), its 'in' is down to the side (58 degrees)
+export const Anatomy = {
+	Waist: { fwd: 45, back: 25, out: 20, inn: 20, twist: [-10, 10] },
+	Spine01: { fwd: 25, back: 12, out: 15, inn: 15, twist: [-25, 25] },
+	Spine02: { fwd: 15, back: 8, out: 12, inn: 12, twist: [-25, 25] },
+	NeckTwist01: { fwd: 20, back: 25, out: 18, inn: 18, twist: [-25, 25] },
+	NeckTwist02: { fwd: 20, back: 25, out: 18, inn: 18, twist: [-25, 25] },
+	Head: { fwd: 15, back: 25, out: 10, inn: 10, twist: [-45, 45] },
+	Clavicle: { fwd: 25, back: 20, out: 45, inn: 12, twist: [-35, 35] },
+	Upperarm: { fwd: 135, back: 55, out: 140, inn: 75, twist: [-90, 90] },
+	Forearm: { fwd: 150, back: 5, out: 5, inn: 5, twist: [-70, 70] },
+	Hand: { fwd: 20, back: 30, out: 70, inn: 80, twist: [-30, 30] },
+	Thigh: { fwd: 150, back: 30, out: 80, inn: 45, twist: [-55, 55] },
+	Calf: { fwd: 5, back: 155, out: 5, inn: 5, twist: [-35, 35] },
+	Foot: { fwd: 30, back: 55, out: 20, inn: 20, twist: [-30, 30] },
 };
 export function humanDefaults() {
 	const out = {};
 	for (const name of Editable) {
 		const base = name.replace(/^[LR]_/, '');
-		if (Human[base]) out[name] = JSON.parse(JSON.stringify(Human[base]));
+		if (Anatomy[base]) out[name] = JSON.parse(JSON.stringify(Anatomy[base]));
 	}
 	return out;
 }
@@ -136,5 +152,13 @@ export async function loadLimits(url = './limits.json') {
 		if (!r.ok) return {};
 		const d = await r.json();
 		return d?.limits ?? {};
+	} catch { return {}; }
+}
+
+// how the spine and neck share a turn between their joints (the form lab's training, kept next to the limits), or {} for the defaults
+export async function loadMix(url = './limits.json') {
+	try {
+		const r = await fetch(url, { cache: 'no-store' });
+		return r.ok ? ((await r.json())?.mix ?? {}) : {};
 	} catch { return {}; }
 }

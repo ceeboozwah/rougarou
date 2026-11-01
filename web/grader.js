@@ -26,7 +26,7 @@ export function startsHold(route) {
 }
 
 // climb it with rehearsal, from the start holds, as far as it goes. Resolves { sent, moves, trace, stuck }
-export async function solve(route, { maxMoves = 32, yieldEvery = 1, finish } = {}) {
+export async function solve(route, { maxMoves = 32, yieldEvery = 1, finish, observe } = {}) {
 	const sim = new Sim([route]);
 	sim.restart();
 	const trace = [];
@@ -45,6 +45,7 @@ export async function solve(route, { maxMoves = 32, yieldEvery = 1, finish } = {
 		const distance = sim.distance(choice.limb, sim.holds()[choice.hold].point) / sim.range(choice.limb);
 		if (!sim.grab(choice.limb, choice.hold)) return { sent: false, moves: move, trace, stuck: stuckAt(sim, options), sim };
 		settle(sim, 45);
+		observe?.(sim);
 		recent.push(`${choice.limb}:${choice.hold}`);
 		if (recent.length > 6) recent.shift();
 		peakPump = Math.max(peakPump, ...sim.pump);

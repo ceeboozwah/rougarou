@@ -7,7 +7,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { toThree } from './gym.js';
-import { jointFrame, clampRel, measure, Editable, loadLimits } from './limits.js';
+import { jointFrame, clampRel, measure, reach as reach_, Editable, loadLimits, loadMix } from './limits.js';
 import { ChalkBag } from './chalkbag.js';
 
 const V = THREE.Vector3, Q = THREE.Quaternion;
@@ -42,9 +42,10 @@ const Fingers = ['Index', 'Mid', 'Ring', 'Pinky'];
 
 export class Figure {
 	static async load(url, { limits = true } = {}) {
-		const [gltf, set] = await Promise.all([new GLTFLoader().loadAsync(url), limits ? loadLimits() : {}]);
+		const [gltf, set, mix] = await Promise.all([new GLTFLoader().loadAsync(url), limits ? loadLimits() : {}, limits ? loadMix() : {}]);
 		const figure = new Figure(gltf);
 		figure.limits = set;
+		figure.setMix(mix);
 		return figure;
 	}
 
@@ -55,8 +56,15 @@ export class Figure {
 		this.names = new Map();
 		// the joint limits from limits.json (see limits.js), the frame of each joint they are measured in, and how often each was held to its limit
 		this.limits = {};
+		// how much of the turn from the pelvis to the chest (and from the chest to the face) each spine and neck joint takes; the form lab trains these
+		this.posture = 1;
+		this.mix = { waist: 0.35, spine01: 0.7, neck1: 0.35, neck2: 0.65 };
 		this.frames = {};
 		this.hits = {};
+		this.misses = [0, 0, 0, 0];
+		this.gaps = [new V(), new V(), new V(), new V()];
+		// how far the whole body may shift (m) to keep the hands and feet on their holds when a joint limit would pull a limb off one
+		this.follow = 0.4;
 		// how far each joint has turned, over everything this character has done, by direction (see watch)
 		this.seen = {};
 		this.meshes = [];
@@ -113,6 +121,7 @@ export class Figure {
 	}
 
 	// new limits from the pose restriction editor, taking effect at the next frame
+	setMix(mix) { this.mix = { waist: 0.35, spine01: 0.7, neck1: 0.35, neck2: 0.65, ...(mix ?? {}) }; }
 	setLimits(set) { this.limits = set ?? {}; this.frames = {}; this.hits = {}; }
 
 	// the boxers take the shorts color from the outfit settings
@@ -227,8 +236,11 @@ export class Figure {
 		return name ? pq.multiply(inv(this.rest[name].q)) : pq;
 	}
 
-	// one arm or leg: two-bone IK from the bone's own shoulder or hip to Target, the middle joint on Pole's side, then the end bone to World.
-	// Flex is the way the joint bends at rest (forward for an elbow, back for a knee)
+	// one arm or leg: two-bone IK from the bone's own shoulder or hip to Target, then the end bone to World. Flex is the way the joint bends at rest (forward
+	// for an elbow, back for a knee). the elbow or knee can sit anywhere on a circle around the line from the root to the target (the swivel): Pole says where it
+	// would like to be, and when the joints have limits the swivel is searched for the angle that keeps the shoulder or hip, and the elbow or knee, inside them
+	// (a hip does not twist 130 degrees to point a knee outward: it swings and the knee goes where the hip allows). if no swivel does, the limit holds the bone
+	// and the limb misses by whatever is left, which is the most the body can do.
 	limb(upperName, lowerName, endName, target, pole, flexRest, endQ) {
 		const upper = this.bones[upperName], lower = this.bones[lowerName], end = this.bones[endName];
 		const L1 = this.length(upperName, lowerName), L2 = this.length(lowerName, endName);
@@ -241,31 +253,70 @@ export class Figure {
 		let side = pole.clone().sub(along.clone().multiplyScalar(pole.dot(along)));
 		if (side.lengthSq() < 1e-8) side = flexRest.clone().sub(along.clone().multiplyScalar(flexRest.dot(along)));
 		side.normalize();
-		const middle = root.clone().addScaledVector(along, x).addScaledVector(side, y);
+		const around = along.clone().cross(side);
 		const wrist = root.clone().addScaledVector(along, reach);
-		const t1 = middle.clone().sub(root).normalize();
-		let t2 = wrist.clone().sub(middle).normalize();
-		// the upper bone: the shortest turn from where its parent carries it, then rolled so the joint bends the way it does at rest
-		const rUp = this.rest[upperName], carriedUp = this.carried(upper);
+		const rUp = this.rest[upperName], rLo = this.rest[lowerName], carriedUp = this.carried(upper);
 		const d0 = spin(this.dirOf(upperName, lowerName), carriedUp);
-		let qU = arc(d0, t1).multiply(carriedUp).multiply(rUp.q);
 		const hinge = this.dirOf(upperName, lowerName).cross(flexRest).normalize();
-		const hereHinge = spin(spin(hinge, inv(rUp.q)), qU);
-		const need = t1.clone().cross(t2);
-		const bend = Math.asin(clamp(need.length(), 0, 1));
-		if (bend > 0.02) {
-			const n = need.normalize();
-			const h = hereHinge.clone().sub(t1.clone().multiplyScalar(hereHinge.dot(t1))).normalize();
-			const phi = Math.atan2(t1.dot(h.clone().cross(n)), h.dot(n));
-			qU = about(t1, phi * clamp((bend - 0.02) / 0.3, 0, 1)).multiply(qU);
+		const parentQ = new Q();
+		upper.parent.updateWorldMatrix(true, false);
+		upper.parent.matrixWorld.decompose(new V(), parentQ, new V());
+		const limU = this.limits[upperName], limL = this.limits[lowerName];
+		// the upper and lower bone for one swivel angle
+		const attempt = (psi) => {
+			const out = side.clone().multiplyScalar(Math.cos(psi)).addScaledVector(around, Math.sin(psi));
+			const middle = root.clone().addScaledVector(along, x).addScaledVector(out, y);
+			const t1 = middle.clone().sub(root).normalize();
+			const t2 = wrist.clone().sub(middle).normalize();
+			// the upper bone: the shortest turn from where its parent carries it, then rolled so the joint bends the way it does at rest
+			let qU = arc(d0, t1).multiply(carriedUp).multiply(rUp.q);
+			const hereHinge = spin(spin(hinge, inv(rUp.q)), qU);
+			const need = t1.clone().cross(t2);
+			const bend = Math.asin(clamp(need.length(), 0, 1));
+			if (bend > 0.02) {
+				const n = need.normalize();
+				const h = hereHinge.clone().sub(t1.clone().multiplyScalar(hereHinge.dot(t1))).normalize();
+				const phi = Math.atan2(t1.dot(h.clone().cross(n)), h.dot(n));
+				qU = about(t1, phi * clamp((bend - 0.02) / 0.3, 0, 1)).multiply(qU);
+			}
+			const carriedLo = qU.clone().multiply(inv(rUp.q));
+			const qL = arc(spin(this.dirOf(lowerName, endName), carriedLo), t2).multiply(carriedLo).multiply(rLo.q);
+			return { qU, qL, middle, t2 };
+		};
+		// how far a swivel takes the shoulder or hip and the elbow or knee past (most of) their ranges, and how far it is from the pole
+		const cost = (psi) => {
+			const a = attempt(psi);
+			let c = 0.6 * (psi / Math.PI) ** 2;
+			for (const [name, lim, q, parent] of [[upperName, limU, a.qU, parentQ], [lowerName, limL, a.qL, a.qU]]) {
+				if (!lim) continue;
+				const frame = this.frames[name] ??= jointFrame(this, name);
+				if (!frame) continue;
+				const m = measure(inv(this.rest[name].local).multiply(inv(parent).multiply(q)), frame);
+				const r = m.theta / Math.max(1, reach_(lim, m.phi * Math.PI / 180));
+				const t = m.twist >= 0 ? m.twist / Math.max(1, lim.twist?.[1] ?? 180) : m.twist / Math.min(-1, lim.twist?.[0] ?? -180);
+				c += 40 * Math.max(0, r - 0.92) ** 2 + 40 * Math.max(0, t - 0.92) ** 2 + 0.5 * Math.max(0, r - 0.7) ** 2 + 0.3 * Math.max(0, t - 0.7) ** 2;
+			}
+			return c;
+		};
+		let psi = 0;
+		if (limU || limL) {
+			let best = cost(0);
+			const steps = 36;
+			for (let k = 0; k < steps; k++) {
+				const p = (k / steps) * 2 * Math.PI - Math.PI, c = cost(p);
+				if (c < best - 1e-9) { best = c; psi = p; }
+			}
+			for (let h = Math.PI / steps; h > 0.004; h *= 0.5) for (const p of [psi - h, psi + h]) { const c = cost(p); if (c < best - 1e-9) { best = c; psi = p; } }
 		}
-		qU = this.put(upper, qU);
+		const chosen = attempt(psi);
+		const middle = chosen.middle;
+		const qU = this.put(upper, chosen.qU);
 		// the elbow or knee is wherever the upper bone, held to its limits, has put it: the lower bone aims at the target from there
 		lower.updateWorldMatrix(true, false);
 		const jointNow = new V().setFromMatrixPosition(lower.matrixWorld);
+		let t2 = chosen.t2;
 		if (wrist.distanceToSquared(jointNow) > 1e-8) t2 = wrist.clone().sub(jointNow).normalize();
 		// the lower bone: carried by the upper, then the shortest turn onto its direction
-		const rLo = this.rest[lowerName];
 		const carriedLo = qU.clone().multiply(inv(rUp.q));
 		const dLo = spin(this.dirOf(lowerName, endName), carriedLo);
 		let qL = arc(dLo, t2).multiply(carriedLo).multiply(rLo.q);
@@ -279,7 +330,10 @@ export class Figure {
 		qL = qL.multiply(about(axis, twist * 0.5));
 		this.put(lower, qL);
 		this.put(end, endQ);
-		return { middle, wrist, reach: reach / (L1 + L2) };
+		// how far from where the limb was aimed it ended up, in meters: nothing but the joint limits can make it miss
+		end.updateWorldMatrix(true, false);
+		const gap = wrist.clone().sub(this.worldP(end));
+		return { middle, wrist, reach: reach / (L1 + L2), miss: gap.length(), gap, psi };
 	}
 
 	// the hands: the turn that takes the rest hand's (fingers, thumb side, back of hand) onto the pose's
@@ -298,13 +352,59 @@ export class Figure {
 		this.watch();
 	}
 
+	// the body posed on the sim's pose. when a limb is held short of its hold by a joint limit, the hips and shoulders move toward it (a person shifts their
+	// weight, they do not leave a hand behind), a few passes, never further than this.follow
 	applyPose(pose, delta = 0) {
+		const base = this.limits;
+		this.stretch = 1;
+		this.#pass(pose, delta, new V());
+		if (!this.follow || !Object.keys(base).length) return;
+		let worst = this.#settle(pose);
+		// a pose the sim asks for that no body could hold (a foot above the hip within a hand's width of it): the joints are stretched past their ranges in steps,
+		// only as far as it takes, rather than leave a foot hanging a meter off its hold. this.stretch says how far it went (1 is within anatomy)
+		for (const k of [1.3, 1.7, 2.5, 4]) {
+			if (worst <= 0.05) break;
+			this.limits = this.stretched(k, base);
+			this.stretch = k;
+			worst = this.#settle(pose);
+		}
+		this.limits = base;
+	}
+
+	// the ranges widened by Factor (the swing and the twist, up to a half turn)
+	stretched(factor, from = this.limits) {
+		const out = {};
+		for (const [n, l] of Object.entries(from)) out[n] = { fwd: Math.min(180, l.fwd * factor), back: Math.min(180, l.back * factor), out: Math.min(180, l.out * factor), inn: Math.min(180, l.inn * factor), twist: [Math.max(-180, l.twist[0] * factor), Math.min(180, l.twist[1] * factor)] };
+		return out;
+	}
+
+	// the body shifted toward whatever a limit holds short of its hold, a few passes. returns the worst miss left (m)
+	#settle(pose) {
+		const offset = new V();
+		this.#pass(pose, 0, offset);
+		for (let pass = 0; pass < 4 && Math.max(...this.misses) > 0.01; pass++) {
+			const step = new V();
+			this.gaps.forEach((g, i) => { if (this.misses[i] > 0.005) step.add(g); });
+			offset.addScaledVector(step, 0.5);
+			if (offset.length() > this.follow) offset.setLength(this.follow);
+			this.#pass(pose, 0, offset);
+		}
+		return Math.max(...this.misses);
+	}
+
+	#pass(pose, delta, offset) {
 		const b = this.bones, rest = this.rest;
-		const [hipR, hipL, shoR, shoL] = pose.roots.map(point);
+		const [hipR, hipL, shoR, shoL] = pose.roots.map(r => point(r).add(offset));
 		const pelvis = hipR.clone().add(hipL).multiplyScalar(0.5), chest = shoR.clone().add(shoL).multiplyScalar(0.5);
 		const up = chest.clone().sub(pelvis).normalize();
 		const framePelvis = leftUp(hipL.clone().sub(hipR), up);
 		const frameChest = leftUp(shoL.clone().sub(shoR), up);
+		// a body does not hold its back straight: reaching up opens the chest (the thoracic spine extends) and reaching with one arm bends the trunk away from it
+		if (this.posture) {
+			const lift = [2, 3].map(l => clamp(up.dot(point(pose.limbs[l].end).sub(l === 2 ? shoR : shoL)) / 0.5, 0, 1));
+			const extension = 16 * Math.min(1, (lift[0] + lift[1]) * 0.55), lateral = 12 * (lift[0] - lift[1]);
+			frameChest.multiply(new Q().setFromEuler(new THREE.Euler(-extension * this.posture * Math.PI / 180, 0, -lateral * this.posture * Math.PI / 180)));
+		}
 		const look = dir(pose.look);
 		const frameHead = faceUp(look, up);
 
@@ -315,11 +415,11 @@ export class Figure {
 		this.bag.update(pelvis, framePelvis, delta);
 		// the spine turns from the pelvis frame to the chest frame, and the neck and head on to where the face looks
 		const mix = (a, c, t) => a.clone().slerp(c, t);
-		this.put(b.Waist, mix(framePelvis, frameChest, 0.35).multiply(rest.Waist.q));
-		this.put(b.Spine01, mix(framePelvis, frameChest, 0.7).multiply(rest.Spine01.q));
+		this.put(b.Waist, mix(framePelvis, frameChest, this.mix.waist).multiply(rest.Waist.q));
+		this.put(b.Spine01, mix(framePelvis, frameChest, this.mix.spine01).multiply(rest.Spine01.q));
 		this.put(b.Spine02, frameChest.clone().multiply(rest.Spine02.q));
-		this.put(b.NeckTwist01, mix(frameChest, frameHead, 0.35).multiply(rest.NeckTwist01.q));
-		this.put(b.NeckTwist02, mix(frameChest, frameHead, 0.65).multiply(rest.NeckTwist02.q));
+		this.put(b.NeckTwist01, mix(frameChest, frameHead, this.mix.neck1).multiply(rest.NeckTwist01.q));
+		this.put(b.NeckTwist02, mix(frameChest, frameHead, this.mix.neck2).multiply(rest.NeckTwist02.q));
 		this.put(b.Head, frameHead.clone().multiply(rest.Head.q));
 
 		for (let l = 0; l < 4; l++) {
@@ -339,7 +439,7 @@ export class Figure {
 				const frame = (o, t, k) => side === 'R' ? basis(o, t, k) : basis(t, o, k);
 				const to = frame(over, thumb, back), from = frame(hf.over0, hf.thumb0, hf.back0);
 				const endQ = to.multiply(inv(from)).multiply(rest[`${side}_Hand`].q);
-				this.limb(`${side}_Upperarm`, `${side}_Forearm`, `${side}_Hand`, end, pole, flex, endQ);
+				{ const r = this.limb(`${side}_Upperarm`, `${side}_Forearm`, `${side}_Hand`, end, pole, flex, endQ); this.misses[l] = r.miss; this.gaps[l] = r.gap; }
 				this.curl(side, hf, h.grip);
 				// a check that the pose's back of hand and the one this hand's chirality gives agree
 				if (h.out && dir(h.out).dot(back) < 0) this.checks.hands[l - 2]++;
@@ -360,7 +460,7 @@ export class Figure {
 				// the ankle sits where the toe on the hold puts it
 				const tip = rest[`${side}_ToeBase`].p.clone().addScaledVector(along0, 0.05);
 				const ankle = toe.clone().sub(spin(tip.sub(rest[`${side}_Foot`].p), turn));
-				this.limb(`${side}_Thigh`, `${side}_Calf`, `${side}_Foot`, ankle, pole, flex, endQ);
+				{ const r = this.limb(`${side}_Thigh`, `${side}_Calf`, `${side}_Foot`, ankle, pole, flex, endQ); this.misses[l] = r.miss; this.gaps[l] = r.gap; }
 			}
 		}
 	}

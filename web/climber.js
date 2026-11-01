@@ -450,7 +450,7 @@ export class Climber {
 				part = { end: ankle, foot: { toe: contact, heel, up: panel.up, dorsum: panel.out } };
 			}
 			// elbows drop down and out, knees splay out and lead upward. a foot on the side the body is turning toward drops its knee
-			const lean = arm ? [0.6, side * 0.5, -0.6] : [0.35, side * (0.3 + 0.9 * this.away), 1];
+			const lean = arm ? [0.6, side * 0.5, -0.6] : [-0.25, side * (0.3 + 0.9 * this.away), 1];
 			let pole = frame.out.mul(lean[0]).add(frame.right.mul(lean[1])).add(frame.up.mul(lean[2]));
 			if (!arm && held) pole = pole.lerp(frame.up.mul(-1).add(frame.right.mul(-side * 0.7)).add(frame.out.mul(0.3)), clamp(this.turn * side, 0, 1) * 0.85);
 			limbs.push({ ...part, pole });

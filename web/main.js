@@ -9,6 +9,7 @@ import { Agent } from './agent.js';
 import { TheWall, DoorWay } from './thewall.js';
 import { PoseEditor } from './poseeditor.js';
 import { FormLab } from './formlab.js';
+import { collectWall } from './wallpose.js';
 import { Prints, ChalkUp } from './chalking.js';
 import { Brain, Memory } from './brain.js';
 import { Climber, walkPose, blend, handOn, solve, awayFromWall } from './climber.js';
@@ -160,7 +161,7 @@ for (const l of gym.lights) {
 
 const climber = new Climber(scene);
 // the form lab (F6): an AI that trains on realistic joint bending and learns limits
-const formLab = new FormLab({ toast: (t, k) => ui.toast(t, k), onApply: (set) => { climber.model?.setLimits(set); agent?.climber?.model?.setLimits(set); } });
+const formLab = new FormLab({ toast: (t, k) => ui.toast(t, k), collect: (chunks, progress) => collectWall(theWall, { chunks, progress }), onApply: (set, mix) => { for (const model of [climber.model, agent?.climber?.model]) { model?.setLimits(set); model?.setMix(mix); } } });
 
 // the pose restriction editor (F3): joint limits for the characters, kept in limits.json and enforced on every skeleton
 const poseEd = new PoseEditor({ renderer, canvas, toast: (t, k) => ui.toast(t, k), onSaved: (set) => { climber.model?.setLimits(set); agent?.climber?.model?.setLimits(set); }, seen: () => climber.model?.seen });
