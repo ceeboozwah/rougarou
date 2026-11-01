@@ -1,4 +1,4 @@
-{"version": 1, "limits": {
+{"version": 1, "mix": {"waist":0.25827240423149733,"spine01":0.6381168677110108,"neck1":0.36468516568935655,"neck2":0.6853978568776414}, "limits": {
   "Head": {"fwd":15,"back":25,"out":10,"inn":10,"twist":[-45,45]},
   "L_Calf": {"fwd":5,"back":155,"out":5,"inn":5,"twist":[-35,35]},
   "L_Clavicle": {"fwd":25,"back":20,"out":45,"inn":12,"twist":[-35,35]},

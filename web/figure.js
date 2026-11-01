@@ -236,6 +236,18 @@ export class Figure {
 		return name ? pq.multiply(inv(this.rest[name].q)) : pq;
 	}
 
+	// how far a point is in front of the wall panels under it, in meters (a big number where there is no wall)
+	wallDepth(p) {
+		let depth = 9;
+		for (const w of this.walls ?? []) {
+			const d = p.clone().sub(w.o), along = d.dot(w.u) + w.start;
+			if (along < w.start - 0.15 || along > w.start + w.length + 0.15) continue;
+			const here = d.dot(w.n);
+			if (here > -0.6) depth = Math.min(depth, here);
+		}
+		return depth;
+	}
+
 	// one arm or leg: two-bone IK from the bone's own shoulder or hip to Target, then the end bone to World. Flex is the way the joint bends at rest (forward
 	// for an elbow, back for a knee). the elbow or knee can sit anywhere on a circle around the line from the root to the target (the swivel): Pole says where it
 	// would like to be, and when the joints have limits the swivel is searched for the angle that keeps the shoulder or hip, and the elbow or knee, inside them
@@ -262,6 +274,7 @@ export class Figure {
 		upper.parent.updateWorldMatrix(true, false);
 		upper.parent.matrixWorld.decompose(new V(), parentQ, new V());
 		const limU = this.limits[upperName], limL = this.limits[lowerName];
+		const clearance = upperName.includes('Thigh') ? 0.1 : 0.07;
 		// the upper and lower bone for one swivel angle
 		const attempt = (psi) => {
 			const out = side.clone().multiplyScalar(Math.cos(psi)).addScaledVector(around, Math.sin(psi));
@@ -287,6 +300,11 @@ export class Figure {
 		const cost = (psi) => {
 			const a = attempt(psi);
 			let c = 0.6 * (psi / Math.PI) ** 2;
+			// the elbow or knee, and the middle of the shin or forearm, must stay out of the wall
+			if (this.walls?.length) {
+				const ankle = a.middle.clone().addScaledVector(a.t2, L2 * 0.5);
+				c += 900 * Math.max(0, clearance - this.wallDepth(a.middle)) ** 2 + 900 * Math.max(0, clearance * 0.6 - this.wallDepth(ankle)) ** 2;
+			}
 			for (const [name, lim, q, parent] of [[upperName, limU, a.qU, parentQ], [lowerName, limL, a.qL, a.qU]]) {
 				if (!lim) continue;
 				const frame = this.frames[name] ??= jointFrame(this, name);
@@ -299,7 +317,7 @@ export class Figure {
 			return c;
 		};
 		let psi = 0;
-		if (limU || limL) {
+		if (limU || limL || this.walls?.length) {
 			let best = cost(0);
 			const steps = 36;
 			for (let k = 0; k < steps; k++) {
@@ -393,6 +411,7 @@ export class Figure {
 	}
 
 	#pass(pose, delta, offset) {
+		this.walls = (pose.walls ?? []).map(w => ({ o: point(w.origin), n: dir(w.out), u: dir(w.up), start: w.start, length: w.length }));
 		const b = this.bones, rest = this.rest;
 		const [hipR, hipL, shoR, shoL] = pose.roots.map(r => point(r).add(offset));
 		const pelvis = hipR.clone().add(hipL).multiplyScalar(0.5), chest = shoR.clone().add(shoL).multiplyScalar(0.5);

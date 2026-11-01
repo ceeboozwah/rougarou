@@ -9,6 +9,7 @@
 //    (cross-entropy method) for the split that, under the anatomical ranges, misses the holds least and strains the body least on the wall poses.
 // 4. APPLY. the anatomical ranges and the trained shares go on the characters, and a second press writes limits.json.
 
+import { Vector3 } from 'three';
 import { Figure } from './figure.js';
 import { Editable, jointFrame, measure, reach, humanDefaults, loadLimits, loadMix } from './limits.js';
 import { revive } from './wallpose.js';
@@ -76,19 +77,23 @@ export class FormLab {
 		}
 		const sp = ['Waist', 'Spine01', 'Spine02'].map(n => turns[n].theta), mean = (sp[0] + sp[1] + sp[2]) / 3;
 		strain += 0.5 * (sp.reduce((s, v) => s + (v - mean) ** 2, 0) / 3) / 64;
-		return { miss: [...f.misses], turns, strain, hits: { ...f.hits }, stretch: f.stretch };
+		// a knee or an elbow inside the wall (less than 2 cm clear of it)
+		let clip = false;
+		for (const n of ['R_Calf', 'L_Calf', 'R_Forearm', 'L_Forearm']) { const e = f.bones[n].matrixWorld.elements; if (f.wallDepth(new Vector3(e[12], e[13], e[14])) < 0.02) clip = true; }
+		return { miss: [...f.misses], turns, strain, hits: { ...f.hits }, stretch: f.stretch, clip };
 	}
 
 	// every pose under one setting: how many limbs land on their holds, how far they miss, how strained the body is, which joints ran into a wall
 	study(limits, mix, poses = this.poses) {
 		const misses = [], strains = [], held = {};
-		let every = 0, knee = 0, elbow = 0, stretched = 0;
+		let every = 0, knee = 0, elbow = 0, stretched = 0, clips = 0;
 		for (const { pose } of poses) {
 			const r = this.replay(pose, limits, mix);
 			misses.push(...r.miss);
 			strains.push(r.strain);
 			if (r.miss.every(m => m < HIT)) every++;
 			if (r.stretch > 1) stretched++;
+			if (r.clip) clips++;
 			for (const n of Object.keys(r.hits)) held[n] = (held[n] ?? 0) + 1;
 			knee = Math.max(knee, r.turns.R_Calf?.theta ?? 0, r.turns.L_Calf?.theta ?? 0);
 			elbow = Math.max(elbow, r.turns.R_Forearm?.theta ?? 0, r.turns.L_Forearm?.theta ?? 0);
@@ -101,7 +106,7 @@ export class FormLab {
 			worst: Math.max(0, ...misses) * 100,
 			strain: strains.reduce((a, b) => a + b, 0) / n,
 			held: Object.fromEntries(Object.entries(held).map(([k, v]) => [k, v / n])),
-			knee, elbow, stretched: stretched / n,
+			knee, elbow, stretched: stretched / n, clip: clips / n,
 		};
 	}
 
@@ -133,7 +138,7 @@ export class FormLab {
 		this.needs = this.demand();
 		const sample = [...this.poses].sort(() => rand() - 0.5).slice(0, 70);
 		// how a split does: misses of the holds (in cm, squared) plus strain, under the anatomical ranges
-		const score = (m) => { const s = this.study(this.anatomy, m, sample); return (s.miss / 1.5) ** 2 + s.worst / 6 + 6 * s.stretched + 0.35 * s.strain; };
+		const score = (m) => { const s = this.study(this.anatomy, m, sample); return (s.miss / 1.5) ** 2 + s.worst / 6 + 6 * s.stretched + 12 * s.clip + 0.35 * s.strain; };
 		let mean = MIXES.map(k => DEFAULT[k]), sigma = MIXES.map(() => 0.22);
 		const toMix = (v) => Object.fromEntries(MIXES.map((k, i) => [k, Math.min(1, Math.max(0, v[i]))]));
 		let best = { v: mean.slice(), cost: score(DEFAULT) };
@@ -331,10 +336,10 @@ export class FormLab {
 		}
 		this.out.replaceChildren();
 		if (this.report) {
-			const t = el('table'); t.append(el('tr', {}, ...['on the wall poses', 'on hold', 'every limb', 'miss cm', 'worst cm', 'past range', 'strain', 'knee°', 'elbow°'].map(h => el('th', { textContent: h }))));
+			const t = el('table'); t.append(el('tr', {}, ...['on the wall poses', 'on hold', 'every limb', 'miss cm', 'worst cm', 'past range', 'in wall', 'strain', 'knee°', 'elbow°'].map(h => el('th', { textContent: h }))));
 			const bestStrain = Math.min(...this.report.slice(1).map(r => r.strain));
-			for (const r of this.report) t.append(el('tr', {}, el('td', { textContent: r.name }), el('td', { textContent: `${round(r.reach * 100)}%` }), el('td', { textContent: `${round(r.every * 100)}%` }), el('td', { textContent: r.miss.toFixed(2) }), el('td', { textContent: r.worst.toFixed(1) }), el('td', { textContent: `${round(r.stretched * 100)}%` }), el('td', { className: r.strain === bestStrain ? 'good' : '', textContent: r.strain.toFixed(2) }), el('td', { textContent: round(r.knee) }), el('td', { textContent: round(r.elbow) })));
-			this.out.append(el('h2', { textContent: 'how it performed' }), t, el('small', { textContent: 'on hold: limbs that land within 1.5 cm of where the climber aimed. every limb: poses where all four do. past range: poses where the sim asked for a reach no body can make within the ranges, so the joints were stretched just far enough to keep the hold. knee and elbow: the most they folded, in degrees (a person folds a knee 135-155 and an elbow 145-150).' }));
+			for (const r of this.report) t.append(el('tr', {}, el('td', { textContent: r.name }), el('td', { textContent: `${round(r.reach * 100)}%` }), el('td', { textContent: `${round(r.every * 100)}%` }), el('td', { textContent: r.miss.toFixed(2) }), el('td', { textContent: r.worst.toFixed(1) }), el('td', { textContent: `${round(r.stretched * 100)}%` }), el('td', { className: r.clip > 0.02 ? 'bad' : 'good', textContent: `${round(r.clip * 100)}%` }), el('td', { className: r.strain === bestStrain ? 'good' : '', textContent: r.strain.toFixed(2) }), el('td', { textContent: round(r.knee) }), el('td', { textContent: round(r.elbow) })));
+			this.out.append(el('h2', { textContent: 'how it performed' }), t, el('small', { textContent: 'on hold: limbs that land within 1.5 cm of where the climber aimed. in wall: poses where a knee or elbow is less than 2 cm clear of the wall. every limb: poses where all four do. past range: poses where the sim asked for a reach no body can make within the ranges, so the joints were stretched just far enough to keep the hold. knee and elbow: the most they folded, in degrees (a person folds a knee 135-155 and an elbow 145-150).' }));
 			if (this.mix) this.out.append(el('p', { textContent: `trained split: the waist takes ${round(this.mix.waist * 100)}% and the mid spine ${round(this.mix.spine01 * 100)}% of the turn from pelvis to chest; the lower neck ${round(this.mix.neck1 * 100)}% and the mid neck ${round(this.mix.neck2 * 100)}% of the turn from chest to face (it was 35, 70, 35, 65).` }));
 		}
 		if (this.needs) {

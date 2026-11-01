@@ -471,6 +471,8 @@ export class Climber {
 		const posed = solve({ roots, up, back: frame.out, head, look: this.look, limbs, marker });
 		// elbows and knees stay out of the wall, so the arms and legs never sink into it
 		posed.limbs.forEach((l, i) => { if (l.bend) l.bend = awayFromWall(face, l.bend, i < 2 ? 11 : 7.5); });
+		// the wall panels around the hips, as plain planes, so the skeleton can keep its knees and elbows out of them (figure.js)
+		posed.walls = (face.near ? face.near(pelvis) : face.panels).slice(0, 4).map(p => ({ origin: p.origin, out: p.out, up: p.up, start: p.start, length: p.length }));
 		return posed;
 	}
 
