@@ -330,6 +330,8 @@ export function buildGym(routes) {
 			}
 	};
 
+	// where every scattered hold sits and how big it is, so a setter can keep new holds off them
+	const placed = [];
 	const decor = [[0.75, 0.03, 0.03], [0.95, 0.62, 0.02], [0.02, 0.18, 0.75], [0.04, 0.36, 0.14], [0.32, 0.1, 0.55], [0.22, 0.24, 0.27], [0.9, 0.3, 0.03], [0.75, 0.75, 0.72]];
 	const sprinkle = (a, b, c, normal, crowd) => {
 		const count = Math.floor(crowd + dice.frand());
@@ -343,13 +345,18 @@ export function buildGym(routes) {
 			const up = rotateAround(V(0, 0, 1), normal, angle);
 			const size = holdSize(Templates[index].kind) * (dice.frand() < 0.07 ? dice.range(1.6, 2.3) : dice.range(0.8, 1.2));
 			const color = swatch(decor[dice.int(0, decor.length - 1)]);
-			buildHold(index, size, holdFrame(a.add(b.sub(a).mul(s)).add(c.sub(a).mul(t)), normal, up), dice.int(0, 1 << 20), paint[color], shadow);
+			const at = a.add(b.sub(a).mul(s)).add(c.sub(a).mul(t));
+			placed.push({ at, size });
+			buildHold(index, size, holdFrame(at, normal, up), dice.int(0, 1 << 20), paint[color], shadow);
 		}
 		if (dice.frand() < 0.035 * crowd) {
 			const black = dice.frand() < 0.6;
 			const up = rotateAround(V(0, 0, 1), normal, dice.range(0, 360));
 			const color = swatch(black ? [0.02, 0.02, 0.025] : [0.2, 0.21, 0.23]);
-			buildHold(pickTemplate('volume', dice.int(0, 9)), dice.range(45, 75), holdFrame(a.add(b).add(c).mul(1 / 3), normal, up), dice.int(0, 1 << 20), paint[color], shadow);
+			// the dice are rolled in the same order as before so the gym looks the same
+			const template = pickTemplate('volume', dice.int(0, 9)), big = dice.range(45, 75);
+			placed.push({ at: a.add(b).add(c).mul(1 / 3), size: big });
+			buildHold(template, big, holdFrame(a.add(b).add(c).mul(1 / 3), normal, up), dice.int(0, 1 << 20), paint[color], shadow);
 		}
 	};
 
@@ -486,7 +493,7 @@ export function buildGym(routes) {
 	for (let x = 1000; x <= 1700; x += 100) block(V(x, -1538, 230), V(6, 6, 460), [0.8, 0.8, 0.8], false);
 	lights.push({ at: V(1350, -1350, 260), color: [0.8, 0.9, 1], intensity: 4, range: 12 });
 
-	return { boards, palette, paint, shadow, blocks, lights, holes };
+	return { boards, palette, paint, shadow, blocks, lights, holes, decorHolds: placed };
 }
 
 // one problem's holds in its tape color, turned so each lip faces away from the way it is pulled. built apart from the gym
@@ -494,6 +501,8 @@ export function buildGym(routes) {
 export function routeHolds(problem, index) {
 	const body = new Sink(), dark = new Sink();
 	problem.holds.forEach((spot, h) => {
+		// a hold the setter has taken off the wall and is carrying is not on it
+		if (spot.carried) return;
 		const face = problem.at(spot.point.y);
 		const up = face.right.mul(-spot.pull.x).add(face.up.mul(-spot.pull.y));
 		const seed = spot.seed ?? h;

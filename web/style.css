@@ -192,3 +192,5 @@ body.menu-open #corner, body.menu-open .hud, body.menu-open #tip { display: none
 	.vw-tools { margin-left: 0; }
 }
 @media (pointer: coarse) { .keys { display: none; } }
+
+#ai { position: fixed; left: max(14px, env(safe-area-inset-left)); bottom: 74px; z-index: 9; font-size: var(--t-sm, 13px); max-width: min(560px, 90vw); pointer-events: none; }

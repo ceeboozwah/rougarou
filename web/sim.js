@@ -100,6 +100,18 @@ export class Sim {
 		this.restart();
 	}
 
+	// a copy of the body and its state to try a move on, for an agent rehearsing before it commits
+	clone() {
+		const c = new Sim(this.routes);
+		c.route = this.route;
+		for (const k of ['position', 'velocity', 'lean', 'goal', 'target']) c[k] = this[k].copy();
+		for (const k of ['grips', 'smeared', 'slips', 'pump', 'latch', 'strain', 'loads']) c[k] = [...this[k]];
+		c.posts = this.posts.map(p => p.copy());
+		c.tips = this.tips.map(p => p.copy());
+		for (const k of ['angle', 'spin', 'won', 'topped', 'reaching', 'squeeze', 'tipping', 'fallen', 'falls', 'hint']) c[k] = this[k];
+		return c;
+	}
+
 	holds() { return this.routes[this.route].holds; }
 	turn(o) { return o.rot(this.angle); }
 	joint(limb) { return this.position.add(this.turn(Body.seats[limb])); }

@@ -8,7 +8,7 @@ export const clock = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStar
 const hex = (c) => `#${c.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('')}`;
 const gradeOf = (route) => parseInt(String(route.grade).replace(/\D/g, ''), 10) || 0;
 
-export const Defaults = { shirt: '#e6dfcc', shorts: '#3f4a2c', shoes: '#e9b812', volume: 0.8, muted: false, look: 1, zoom: 1, quality: 'auto', gauges: true };
+export const Defaults = { shirt: '#e6dfcc', shorts: '#3f4a2c', shoes: '#e9b812', volume: 0.8, muted: false, look: 1, zoom: 1, quality: 'auto', gauges: true, ai: false, aimode: 'rehearse' };
 const Swatches = {
 	shirt: ['#e6dfcc', '#f4f1ea', '#1d1d20', '#c8553d', '#2f5d8a', '#6b8f71', '#e8b4b8'],
 	shorts: ['#3f4a2c', '#1d1d20', '#2b3a55', '#7a5c3e', '#8a8f96', '#a33b2b'],
@@ -140,6 +140,9 @@ export class UI {
 			<div><h3>display</h3>
 				<div class="field"><label>graphics</label>${toggle('quality', [['auto', 'auto'], ['high', 'high'], ['low', 'fast']])}</div>
 				<div class="field"><label>pump and weight</label>${toggle('gauges', [[true, 'show'], [false, 'hide']])}</div></div>
+			<div><h3>ai climber</h3><div class="field"><label>second climber</label>${toggle('ai', [[false, 'off'], [true, 'on']])}</div>
+				<div class="field"><label>how it plays</label>${toggle('aimode', [['rehearse', 'climbs: rehearses'], ['blind', 'climbs: hard'], ['watch', 'watches me'], ['set', 'sets routes']])}</div>
+				<div class="field"><small>an AI that tours the gym and climbs from the easiest problem up, asking OpenAI for each move through tools/devserver.py (needs OPENAI_API_KEY set there; without it, it rehearses on its own). press b to watch it. "watches me" keeps it beside you while you climb, learning from what you do, and it uses that next time it climbs.</small></div></div>
 			<div><h3>progress</h3><div class="field"><button class="ghost danger" id="wipe">reset my tick list</button></div></div>`;
 		const el = $('settings');
 		const apply = () => { this.save(); this.hooks.apply(this.settings); };

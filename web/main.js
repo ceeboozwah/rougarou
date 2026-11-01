@@ -4,6 +4,9 @@
 import * as THREE from 'three';
 import { Sim, Vec2, Vec3, Names } from './sim.js';
 import { problems, buildGym, routeHolds, toThree, Overview, Focus, tape } from './gym.js';
+import { Figure } from './figure.js';
+import { Agent } from './agent.js';
+import { Brain, Memory } from './brain.js';
 import { Climber, walkPose, blend, handOn, solve, awayFromWall } from './climber.js';
 import { Ragdoll } from './ragdoll.js';
 import { World, floorAt } from './world.js';
@@ -144,6 +147,9 @@ for (const l of gym.lights) {
 }
 
 const climber = new Climber(scene);
+// the skinned character takes over from the tubes once it has loaded; ?tubes keeps the tubes, and so does a failed load
+if (!new URLSearchParams(location.search).has('tubes'))
+	Figure.load('./assets/character/climber.glb').then(f => { climber.wear(f); climber.model.root.visible = true; }).catch(e => console.warn('the character did not load, keeping the tubes', e));
 
 const world = new World(gym.blocks);
 let spots = null;
@@ -152,11 +158,11 @@ routes.forEach((_, i) => rebuild(i));
 spots = routes.map(r => world.startSpot(r));
 
 // a grade tag over every problem, the way a gym tapes its starts
-const tags = routes.map((route, index) => {
-	const paper = document.createElement('canvas');
-	paper.width = 512;
-	paper.height = 200;
+const papers = [];
+const paintTag = (route, index) => {
+	const paper = papers[index];
 	const g = paper.getContext('2d');
+	g.clearRect(0, 0, 512, 200);
 	g.fillStyle = 'rgba(16, 16, 20, 0.84)';
 	g.beginPath();
 	g.roundRect(0, 0, 512, 200, 36);
@@ -171,14 +177,34 @@ const tags = routes.map((route, index) => {
 	g.fillStyle = 'rgba(243, 239, 230, 0.72)';
 	g.font = '700 46px ui-rounded, system-ui, sans-serif';
 	g.fillText(route.name, 74, 168);
+};
+const tags = routes.map((route, index) => {
+	const paper = document.createElement('canvas');
+	paper.width = 512;
+	paper.height = 200;
+	papers[index] = paper;
+	paintTag(route, index);
 	const map = new THREE.CanvasTexture(paper);
 	map.colorSpace = THREE.SRGBColorSpace;
+	map.userData.paper = true;
 	const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map, transparent: true }));
 	sprite.scale.set(0.82, 0.32, 1);
 	sprite.position.copy(three(spots[index].at.add(Z.mul(255))));
 	scene.add(sprite);
 	return sprite;
 });
+// a renamed or regraded problem repaints its sign
+const retag = (index) => { paintTag(routes[index], index); tags[index].material.map.needsUpdate = true; };
+// the second climber, an AI (settings -> ai climber); it needs the spots and the world, so it is made here
+let agent = null;
+const watching = { on: false };
+// what the human does is watched for the AI to learn from: a start, each hold a limb goes to, and how it ends (see Agent.watchStart)
+{
+	agent = new Agent({ scene, routes, spots, world, brain: new Brain(), memory: new Memory(),
+		hooks: { rebuild: (i) => rebuild(i), commit: (i, meta) => editor.commitRoute(i, meta), retag: (i) => retag(i), decor: () => gym.decorHolds, puff: (at) => chalk.puff(at, 10) } });
+	const grab = sim.grab.bind(sim);
+	sim.grab = (limb, hold) => { const ok = grab(limb, hold); if (ok && mode === 'climb') agent.watchMove(limb, hold); return ok; };
+}
 // rings that pulse on the start holds of the problem in front of you
 const rings = [0, 1].map(() => {
 	const ring = new THREE.Mesh(new THREE.TorusGeometry(0.12, 0.009, 8, 40), new THREE.MeshBasicMaterial({ color: 0xffe640, transparent: true, opacity: 0.85 }));
@@ -249,6 +275,7 @@ const recorder = new Recorder({ canvas, audio, hud: { toast: (t, k) => ui.toast(
 $('corner').prepend(recorder.recBtn);
 function applySettings(s) {
 	climber.setOutfit(s);
+	if (agent) { agent.blind = s.aimode === 'blind'; agent.apprentice = s.aimode === 'watch'; agent.setting = s.aimode === 'set'; if (s.ai && !agent.on) agent.enable(); else if (!s.ai && agent.on) { agent.disable(); watching.on = false; } }
 	audio.set(s.volume, s.muted);
 	// fast trades shadow sharpness and resolution for frame rate; auto picks fast on a phone
 	const fast = s.quality === 'low' || (s.quality === 'auto' && touchy);
@@ -298,6 +325,14 @@ const glow = (() => {
 	return sprite;
 })();
 
+// b: watch the AI climber, or go back to the player
+function toggleWatch() {
+	if (!agent?.on) { ui.toast('turn the ai climber on in settings first', 'warn'); return; }
+	watching.on = !watching.on;
+	if (watching.on && fp.want) toggleFirstPerson();
+	ui.toast(watching.on ? 'watching the ai: b to come back' : 'back on you', 'good');
+}
+
 function toggleFirstPerson() {
 	if (!fp.want && mode !== 'climb') return;
 	fp.want = !fp.want;
@@ -314,8 +349,9 @@ function toggleFirstPerson() {
 
 // turn the first person view; the pitch stops short of straight up and down
 function fpLook(dx, dy) {
-	fp.yaw = clamp(fp.yaw + dx, -2.8, 2.8);
-	fp.pitch = clamp(fp.pitch - dy, -1.4, 1.4);
+	// the neck turns 80 degrees each way and the eyes and a twist of the body make up the rest
+	fp.yaw = clamp(fp.yaw + dx, -2.4, 2.4);
+	fp.pitch = clamp(fp.pitch - dy, -1.35, 1.2);
 }
 
 // the hold nearest the middle of the screen, as the closest to the line of sight in centimeters (relative to how big a target it is at that range)
@@ -439,6 +475,7 @@ function letGo() { limb = -1; }
 
 // a fresh go at the current problem: the clock restarts and it counts as an attempt
 function begin() {
+	agent?.watchStart(sim.route);
 	started = climber.clock;
 	finished = 0;
 	latched = [...sim.latch];
@@ -447,6 +484,7 @@ function begin() {
 }
 
 function sent() {
+	agent?.watchEnd('sent');
 	const route = routes[sim.route];
 	finished = climber.clock - started;
 	const was = ui.send(route, finished);
@@ -561,6 +599,7 @@ function stand(at) {
 }
 
 function startFall() {
+	agent?.watchEnd('fell', sim.hint);
 	const face = routes[sim.route], panel = face.at(sim.position.y);
 	const velocity = panel.right.mul(sim.velocity.x * 100).add(panel.up.mul(sim.velocity.y * 100));
 	ragdoll = new Ragdoll(pose, velocity, face);
@@ -587,6 +626,7 @@ function getUp() {
 
 function jumpDown() {
 	if (mode !== 'climb') return;
+	agent?.watchEnd('left');
 	const face = routes[sim.route], spot = spots[sim.route];
 	const hips = face.map(sim.position, 0);
 	const at = world.clear(new Vec3(hips.x, hips.y, 0).add(spot.out.mul(40)), spot.out);
@@ -602,6 +642,7 @@ function jumpDown() {
 
 function retry() {
 	if (mode !== 'climb' && mode !== 'fall') return;
+	agent?.watchEnd('left');
 	sim.restart();
 	climber.reset();
 	ragdoll = null;
@@ -717,6 +758,7 @@ addEventListener('keydown', (e) => {
 	if (k === 'm' || (k === 'escape' && limb < 0 && mode !== 'edit')) { ui.toggle(); return; }
 	if (ui.open || recorder.view) return;
 	if (k === 'v' && !e.repeat) { toggleFirstPerson(); return; }
+	if (k === 'b' && !e.repeat) { toggleWatch(); return; }
 	if (fpOn() && !e.ctrlKey && !e.metaKey) {
 		// hips: an arrow key latches that shift until it is pressed again (or space centers them), so wasd is free for picking limbs
 		const dir = { arrowleft: [1, 0], arrowright: [-1, 0], arrowup: [0, 1], arrowdown: [0, -1] }[k];
@@ -764,6 +806,7 @@ $('again').onclick = retry;
 $('onward').onclick = jumpDown;
 $('nextUp').onclick = () => goTo((sim.route + 1) % routes.length, true);
 $('fpBtn').onclick = toggleFirstPerson;
+$('watch').onclick = toggleWatch;
 $('fpRH').onclick = () => sendLimb(2);
 $('fpLH').onclick = () => sendLimb(3);
 $('fpRF').onclick = () => sendLimb(0);
@@ -932,6 +975,10 @@ function update(real) {
 	climber.group.visible = mode !== 'edit';
 	climber.draw(pose);
 	chalk.step(delta);
+	if (agent) {
+		agent.player = { mode, route: sim.route, at: walker.at, yaw: walker.yaw, heading: walker.heading, pos: sim.position };
+		agent.update(delta);
+	}
 
 	// the opening shot holds the whole gym, then swoops in; g flips back to it
 	elapsed += real;
@@ -941,6 +988,22 @@ function update(real) {
 	const pelvis = mid(pose.roots[0], pose.roots[1]);
 	let goal, target, speed;
 	if (overview) { goal = Overview; target = Focus; speed = 1.6; }
+	else if (watching.on && agent.on && agent.pose) {
+		// watching the AI: over its shoulder on the wall, or behind it as it walks
+		const ap = agent.pose, apelvis = mid(ap.roots[0], ap.roots[1]);
+		if (['climb', 'mount', 'cheer', 'tumble'].includes(agent.mode) && agent.route) {
+			const aface = agent.route, apanel = aface.at(agent.mode === 'tumble' ? 1.2 : agent.sim.position.y);
+			const aout = new Vec3(apanel.out.x, apanel.out.y, 0);
+			if (aout.len() > 0.3) behind = aout.norm();
+			goal = apelvis.add(behind.mul(aface.stand * ui.settings.zoom)).add(apanel.right.mul(aface.aside)).add(new Vec3(0, 0, 30));
+			target = apelvis.add(new Vec3(0, 0, 25));
+		} else {
+			const way = new Vec3(Math.cos(agent.yaw), Math.sin(agent.yaw), 0);
+			target = agent.at.add(Z.mul(145));
+			goal = target.sub(way.mul(330 * ui.settings.zoom)).add(Z.mul(40));
+		}
+		speed = view.dist(goal) > 400 ? 2.5 : 5;
+	}
 	else if (mode === 'walk') {
 		// over the shoulder, pulled in rather than looking through a wall
 		const direction = new Vec3(Math.cos(camYaw) * Math.cos(camPitch), Math.sin(camYaw) * Math.cos(camPitch), Math.sin(camPitch));
@@ -983,7 +1046,8 @@ function update(real) {
 		const F = fp.F, U = fp.U.sub(F.mul(fp.U.dot(F))).norm(), R = U.cross(F), cp = Math.cos(fp.pitch);
 		const dir = F.mul(cp * Math.cos(fp.yaw)).add(R.mul(cp * Math.sin(fp.yaw))).add(U.mul(Math.sin(fp.pitch)));
 		// the eyes sit at the head and never nearer the wall than about a hand's length
-		const eye = awayFromWall(face, pose.head.add(F.mul(12)).add(U.mul(2)), 18);
+		// through the character's own eyes when it is worn, else just ahead of the tubes' head
+		const eye = awayFromWall(face, climber.model ? unreal(climber.model.eye()).add(F.mul(9)).add(U.mul(1)) : pose.head.add(F.mul(12)).add(U.mul(2)), 18);
 		fp.eye = awayFromWall(face, fp.eye ? fp.eye.lerp(eye, Math.min(1, delta * 30)) : eye, 18);
 		const t = ease(fp.k);
 		camera.position.copy(three(view.lerp(fp.eye, t)));
@@ -1064,6 +1128,10 @@ function update(real) {
 	show('drop', mode === 'climb' && limb < 0);
 	show('retry', mode === 'climb' || mode === 'fall');
 	show('fpBtn', mode === 'climb');
+	show('watch', !!agent?.on);
+	$('watch').textContent = watching.on ? 'back to me' : 'watch the ai';
+	$('ai').hidden = !agent?.on;
+	if (agent?.on) $('ai').textContent = agent.summary();
 	$('fpBtn').textContent = fp.want ? 'third person' : 'first person';
 	for (const id of ['fpRH', 'fpLH', 'fpRF', 'fpLF']) show(id, fpOn());
 	show('pull', mode === 'walk' && !!near);
@@ -1089,6 +1157,6 @@ else { walker.near = -1; pose = walkerPose(); }
 $('loading').remove();
 requestAnimationFrame(frame);
 // a handle for poking at the game from the console
-window.rougarou = { camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
+window.rougarou = { agent, watching, camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
 	// run the game forward without waiting on the browser's frame clock
 	tick: (seconds) => { for (let t = 0; t < seconds; t += 1 / 60) update(1 / 60); } };

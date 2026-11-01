@@ -6,7 +6,7 @@ import { Vec2 } from './sim.js';
 import { toThree } from './gym.js';
 
 const Kinds = ['jug', 'crimp', 'sloper', 'pinch', 'pocket'];
-const Key = 'rougarou-sets';
+const Key = 'rougarou-sets', Meta = 'rougarou-setter';
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const three = (v) => new THREE.Vector3(...toThree(v));
 const pack = (h) => ({ x: h.point.x, y: h.point.y, kind: h.kind, px: h.pull.x, py: h.pull.y, seed: h.seed });
@@ -39,7 +39,24 @@ export class Editor {
 		originals.forEach(r => r.holds.forEach((h, i) => { h.seed ??= i; }));
 		let saved = {};
 		try { saved = JSON.parse(localStorage.getItem(Key) || '{}'); } catch { /* none */ }
-		routes.forEach(r => { if (saved[r.name]) { r.holds = saved[r.name].map(unpack); r.edited = true; } });
+		// sets are kept under the problem's original name, since the setter can rename a problem
+		routes.forEach((r, i) => { const key = originals[i].name; if (saved[key]) { r.holds = saved[key].map(unpack); r.edited = true; } });
+		let meta = {};
+		try { meta = JSON.parse(localStorage.getItem(Meta) || '{}'); } catch { /* none */ }
+		routes.forEach((r, i) => { const m = meta[originals[i].name]; if (m) { r.name = m.name ?? r.name; r.grade = m.grade ?? r.grade; r.setter = m.by; } });
+	}
+
+	// keep a problem as it is now, however it was changed (the user's setter or the AI's): its holds, and its name and grade if given
+	commitRoute(index, meta) {
+		const keep = this.index;
+		this.index = index;
+		this.save();
+		this.index = keep;
+		if (!meta) return;
+		let all = {};
+		try { all = JSON.parse(localStorage.getItem(Meta) || '{}'); } catch { /* none */ }
+		all[this.originals[index].name] = meta;
+		try { localStorage.setItem(Meta, JSON.stringify(all)); } catch { /* this session only */ }
 	}
 
 	get active() { return this.index >= 0; }
@@ -62,7 +79,8 @@ export class Editor {
 		try { saved = JSON.parse(localStorage.getItem(Key) || '{}'); } catch { /* none */ }
 		const route = this.route, original = this.originals[this.index];
 		const same = route.holds.length === original.holds.length && route.holds.every((h, i) => JSON.stringify(pack(h)) === JSON.stringify(pack(original.holds[i])));
-		if (same) delete saved[route.name]; else saved[route.name] = route.holds.map(pack);
+		const key = this.originals[this.index].name;
+		if (same) delete saved[key]; else saved[key] = route.holds.map(pack);
 		route.edited = !same;
 		try { localStorage.setItem(Key, JSON.stringify(saved)); } catch { /* this session only */ }
 	}

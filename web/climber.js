@@ -44,17 +44,123 @@ export function awayFromWall(face, p, min) {
 	return out;
 }
 
-// elbows and knees: a two-bone bend toward each limb's pole, at the real limb length
+// the tightest an elbow or knee folds, as the angle between its two bones: legs, then arms
+export const Folds = [30, 30, 35, 35].map(d => d * Math.PI / 180);
+
+// move a hand or foot, and everything drawn from it, by a shift
+function slide(limb, shift) {
+	limb.end = limb.end.add(shift);
+	if (limb.hand) limb.hand = { ...limb.hand, palm: limb.hand.palm.add(shift) };
+	if (limb.foot) limb.foot = { ...limb.foot, toe: limb.foot.toe.add(shift), heel: limb.foot.heel.add(shift) };
+}
+
+// how far each joint turns, from the torso's own frame (front, outward, up). the shoulder swings freely except behind the back
+// (about 50 degrees past the shoulder line) and the hip is stiffer: a leg goes about 60 degrees behind the torso (the torso itself leans in on a steep wall,
+// which counts), 85 out to the side and 70 across.
+// the spine twists 50 degrees between hips and shoulders and the neck 80 each way, 55 down and 65 up. angles in degrees
+export const Joints = { arm: { behind: 50, across: 90 }, leg: { behind: 60, out: 85, across: 70 }, twist: 50, neck: { yaw: 80, down: 55, up: 65 } };
+// what the limits did, for checking them against real play: the most a limit moved a hand or foot or turned the body
+export const limitStats = { swing: 0, twist: 0, neck: 0, shift: 0, by: [0, 0, 0, 0] };
+const rad = (d) => d * Math.PI / 180;
+
+// a vector turned by Angle about Axis
+function turnAbout(v, axis, angle) {
+	const c = Math.cos(angle), s = Math.sin(angle);
+	return v.mul(c).add(axis.cross(v).mul(s)).add(axis.mul(axis.dot(v) * (1 - c)));
+}
+
+// keep the body's joints inside what a person can do, before the elbows and knees are bent: the spine twist, each shoulder
+// and hip's swing (a hand or foot asked past it is carried back to the edge) and the neck on the look direction
+function limitJoints(pose) {
+	const [hipR, hipL, shoR, shoL] = pose.roots;
+	const pelvis = mid(hipR, hipL);
+	let chest = mid(shoR, shoL);
+	const up = chest.sub(pelvis).norm();
+	if (up.nearZero() || !pose.back) return;
+	const flat = (v) => v.sub(up.mul(v.dot(up)));
+	const front = flat(pose.back.mul(-1)).norm();
+	// the spine: the shoulders turn against the hips about the spine, up to Twist
+	const hips = flat(hipL.sub(hipR)).norm(), shoulders = flat(shoL.sub(shoR)).norm();
+	if (!hips.nearZero() && !shoulders.nearZero()) {
+		const twist = Math.atan2(hips.cross(shoulders).dot(up), hips.dot(shoulders));
+		const excess = Math.abs(twist) - rad(Joints.twist);
+		if (excess > 0) {
+			const back = -Math.sign(twist) * excess;
+			pose.roots[2] = chest.add(turnAbout(shoR.sub(chest), up, back));
+			pose.roots[3] = chest.add(turnAbout(shoL.sub(chest), up, back));
+			limitStats.twist = Math.max(limitStats.twist, excess * 180 / Math.PI);
+		}
+	}
+	chest = mid(pose.roots[2], pose.roots[3]);
+	// each shoulder and hip: the direction of the limb in the torso's frame, held off the sides it cannot reach
+	pose.limbs.forEach((limb, index) => {
+		const leg = index < 2;
+		const root = pose.roots[index];
+		const side = flat(root.sub(leg ? pelvis : chest)).norm();
+		const outward = side.sub(front.mul(side.dot(front))).norm();
+		const reach = limb.end.sub(root);
+		const length = reach.len();
+		if (length < 1e-3 || outward.nearZero()) return;
+		const d = reach.mul(1 / length);
+		let f = d.dot(front), s = d.dot(outward);
+		const u = d.dot(up);
+		const [behind, out, across] = leg ? [Joints.leg.behind, Joints.leg.out, Joints.leg.across] : [Joints.arm.behind, 90, Joints.arm.across];
+		// behind: how far past the line through the joint the limb may point backward. an arm pointing down can go further back than
+		// a leg, and nothing stops either swinging forward
+		const f2 = Math.max(f, -Math.sin(rad(behind)));
+		const s2 = Math.min(Math.max(s, -Math.sin(rad(across))), Math.sin(rad(out)));
+		if (f2 === f && s2 === s) return;
+		const u2 = (u < 0 ? -1 : 1) * Math.sqrt(Math.max(0, 1 - f2 * f2 - s2 * s2));
+		const end = root.add(front.mul(f2).add(outward.mul(s2)).add(up.mul(u2)).mul(length));
+		limitStats.swing = Math.max(limitStats.swing, Math.acos(Math.min(1, d.dot(end.sub(root).norm()))) * 180 / Math.PI);
+		limitStats.shift = Math.max(limitStats.shift, end.dist(limb.end));
+		limitStats.by[index] = Math.max(limitStats.by[index], end.dist(limb.end));
+		slide(limb, end.sub(limb.end));
+	});
+	// the neck: the look direction can turn Yaw each way and tip Down and Up from the way the chest faces
+	if (pose.look) {
+		const across = flat(shoL.sub(shoR)).norm();
+		const side = across.sub(front.mul(across.dot(front))).norm();
+		const look = pose.look.norm();
+		const lf = look.dot(front), ls = look.dot(side), lu = look.dot(up);
+		const yaw = Math.atan2(ls, lf), pitch = Math.atan2(lu, Math.hypot(lf, ls));
+		const y = Math.max(-rad(Joints.neck.yaw), Math.min(rad(Joints.neck.yaw), yaw));
+		const p = Math.max(-rad(Joints.neck.down), Math.min(rad(Joints.neck.up), pitch));
+		if (y !== yaw || p !== pitch) {
+			limitStats.neck = Math.max(limitStats.neck, Math.max(Math.abs(y - yaw), Math.abs(p - pitch)) * 180 / Math.PI);
+			pose.look = front.mul(Math.cos(p) * Math.cos(y)).add(side.mul(Math.cos(p) * Math.sin(y))).add(up.mul(Math.sin(p)));
+		}
+	}
+}
+
+// elbows and knees: a two-bone bend toward each limb's pole, at the real limb length. an elbow or knee is a hinge: it only
+// folds toward its pole side (the pole is steadied by the body's back direction, so it cannot flip when the limb lines up
+// with it), it never hyperextends, and it closes no tighter than Folds, which holds a hand off the shoulder or a foot off the hip
 export function solve(pose) {
+	limitJoints(pose);
 	pose.limbs.forEach((limb, index) => {
 		if (limb.bend) return;
 		const root = pose.roots[index];
-		const toward = limb.end.sub(root);
+		let toward = limb.end.sub(root);
 		// a limb asked past its length stretches a little rather than coming apart from the hand or foot
 		const length = Math.max(Bones[index], toward.len() / 2 + 0.5);
+		// asked to fold tighter than the joint can, the end stops at the tightest fold and carries the hand or foot with it
+		const closest = 2 * length * Math.sin(Folds[index] / 2);
+		if (toward.len() < closest) {
+			const along = toward.len() > 1e-4 ? toward.norm() : limb.pole.norm();
+			slide(limb, along.mul(closest - toward.len()));
+			toward = limb.end.sub(root);
+		}
 		const reach = Math.min(toward.len(), length * 2 - 0.1);
 		const direction = toward.norm();
-		const pole = limb.pole.sub(direction.mul(limb.pole.dot(direction))).norm();
+		const side = limb.pole.norm();
+		let pole = side.sub(direction.mul(side.dot(direction)));
+		if (pole.len() < 0.35 && pose.back) {
+			// the limb runs along its pole: lean on the back direction so the joint keeps the side it had
+			const back = pose.back.sub(direction.mul(pose.back.dot(direction)));
+			pole = pole.add(back.norm().mul(0.35 - pole.len()));
+		}
+		pole = pole.norm();
 		limb.bend = root.add(direction.mul(reach / 2)).add(pole.mul(Math.sqrt(Math.max(0, length * length - reach * reach / 4))));
 		limb.joint = root.add(direction.mul(reach));
 	});
@@ -95,7 +201,7 @@ export function walkPose(w, clock) {
 		const pitch = Math.max(0, Math.cos(step)) * amp * 0.25;
 		const toe = ankle.add(f.mul(15)).sub(Z.mul(7 + 15 * pitch));
 		const heel = ankle.sub(f.mul(5)).sub(Z.mul(6.5 - 5 * pitch));
-		return { end: ankle, pole: f.add(r.mul((l === 0 ? 1 : -1) * 0.2)), foot: { toe, heel, up: Z } };
+		return { end: ankle, pole: f.add(r.mul((l === 0 ? 1 : -1) * 0.2)), foot: { toe, heel, up: Z, dorsum: Z } };
 	});
 	for (const l of [2, 3]) {
 		const s = l === 2 ? 1 : -1;
@@ -190,6 +296,7 @@ export class Climber {
 	setFirstPerson(on) {
 		if (this.inside === on) return;
 		this.inside = on;
+		if (this.model) { this.model.firstPerson(on); return; }
 		this.headParts.forEach((m, i) => { m.material = on ? this.ghost : this.headPaint[i]; });
 		// the key light sits over the camera's shoulder, so your own shadow would cover everything you look at
 		this.casting ??= new Map();
@@ -231,6 +338,8 @@ export class Climber {
 
 	// the outfit colors, as css hex strings
 	setOutfit({ shirt, shorts, shoes }) {
+		this.outfit = { shirt, shorts, shoes };
+		this.model?.tint(this.outfit);
 		if (shirt) this.cloth.shirt.color.set(shirt);
 		if (shorts) this.cloth.shorts.color.set(shorts);
 		if (shoes) this.cloth.shoes.color.set(shoes);
@@ -337,7 +446,7 @@ export class Climber {
 				// a climbing shoe: toe on the hold, heel out from the wall and a little low, the ankle above the heel
 				const ankle = contact.add(panel.out.mul(14)).add(panel.up.mul(7));
 				const heel = contact.add(panel.out.mul(19)).sub(panel.up.mul(1.5));
-				part = { end: ankle, foot: { toe: contact, heel, up: panel.up } };
+				part = { end: ankle, foot: { toe: contact, heel, up: panel.up, dorsum: panel.out } };
 			}
 			// elbows drop down and out, knees splay out and lead upward. a foot on the side the body is turning toward drops its knee
 			const lean = arm ? [0.6, side * 0.5, -0.6] : [0.35, side * (0.3 + 0.9 * this.away), 1];
@@ -395,7 +504,23 @@ export class Climber {
 		this.shirt.geometry.computeVertexNormals();
 	}
 
+	// wear a skinned character (figure.js) instead of the tubes and boxes; null goes back to them
+	wear(figure) {
+		if (this.model) this.group.remove(this.model.root);
+		this.model = figure;
+		for (const child of this.group.children) if (child !== figure?.root && child !== this.marker) child.visible = !figure;
+		if (figure) { this.group.add(figure.root); figure.tint(this.outfit ?? {}); }
+		this.inside = undefined;
+	}
+
 	draw(pose) {
+		if (this.model) {
+			this.drawn = this.clock;
+			this.model.apply(pose);
+			this.marker.visible = !!pose.marker;
+			if (pose.marker) this.marker.position.copy(three(pose.marker));
+			return;
+		}
 		const delta = this.clock - this.drawn;
 		this.drawn = this.clock;
 		const [hipR, hipL] = pose.roots;

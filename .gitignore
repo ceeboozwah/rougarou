@@ -11,3 +11,5 @@ unity/obj/
 # the scanned character rig stays local: it is a personal likeness and a mixamo asset
 unity/Assets/Resources/blaize.fbx
 unity/Assets/Resources/blaize.fbx.meta
+tools/.cache/
+__pycache__/
