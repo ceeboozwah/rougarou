@@ -11,6 +11,7 @@ import { Ragdoll } from './ragdoll.js';
 import { floorAt } from './world.js';
 import { toThree } from './gym.js';
 import { Setter } from './setter.js';
+import { ChalkUp } from './chalking.js';
 import { rehearse, blindList, describe, choose, Shifts, ShiftNames, TEACHER } from './brain.js';
 
 const Z = new Vec3(0, 0, 1);
@@ -31,8 +32,11 @@ const RECENT = 8;
 
 export class Agent {
 	constructor({ scene, routes, spots, world, brain, memory, hooks }) {
-		Object.assign(this, { scene, routes, spots, world, brain, memory });
+		Object.assign(this, { scene, routes, spots, world, brain, memory, hooks });
 		this.sim = new Sim(routes);
+		this.sim.sweat = true;
+		this.chalkUp = null;
+		this.latched = [1, 1, 1, 1];
 		this.on = false;
 		this.blind = false;
 		this.apprentice = false;
@@ -71,7 +75,7 @@ export class Agent {
 	}
 
 	// the curriculum: problems by grade, easiest first, ties in gym order; the next one it has not sent
-	order() { return this.routes.map((r, i) => i).sort((a, b) => number(this.routes[a]) - number(this.routes[b]) || a - b); }
+	order() { return this.routes.map((r, i) => i).filter(i => !this.routes[i].endless).sort((a, b) => number(this.routes[a]) - number(this.routes[b]) || a - b); }
 	next() { return this.order().find(i => this.memory.sends(this.routes[i].name) < NEED) ?? -1; }
 
 	async enable() {
@@ -152,9 +156,9 @@ export class Agent {
 		const r = this.route;
 		const where = r ? `${r.name} ${r.grade}` : 'every problem sent';
 		const key = this.brain.key ? `${this.brain.model} ${this.brain.calls}/${this.brain.cap}` : this.brain.error || 'rehearsal only';
-		return `ai: ${this.status || this.mode} · ${where} · try ${this.memory.tries(this.name) + (this.mode === 'climb' ? 0 : 1)} · sent ${this.sentCount()}/${this.routes.length} · ${key}`;
+		return `ai: ${this.status || this.mode} · ${where} · try ${this.memory.tries(this.name) + (this.mode === 'climb' ? 0 : 1)} · sent ${this.sentCount()}/${this.routes.filter(r => !r.endless).length} · ${key}`;
 	}
-	sentCount() { return this.routes.filter(r => this.memory.sends(r.name) >= NEED).length; }
+	sentCount() { return this.routes.filter(r => !r.endless && this.memory.sends(r.name) >= NEED).length; }
 
 	// ------------------------------------------------------------ walking
 	standing(delta, goal, face) {
@@ -294,7 +298,8 @@ export class Agent {
 	// nothing left to climb: wander between the problems
 	wander(delta) {
 		if (!this.goal || this.at.dist(this.goal) < 20) {
-			const spot = this.spots[Math.floor(Math.random() * this.spots.length)];
+			const open = this.spots.filter((s, i) => !this.routes[i].endless);
+			const spot = open[Math.floor(Math.random() * open.length)];
 			this.goal = this.world.clear(spot.at.add(spot.out.mul(160)), spot.out);
 		}
 		this.standing(delta, this.goal);
@@ -305,6 +310,8 @@ export class Agent {
 	begin() {
 		this.sim.route = this.index;
 		this.sim.restart();
+		this.chalkUp = null;
+		this.climber.chalking = null;
 		this.climber.reset();
 		this.from = this.pose;
 		this.mode = 'mount';
@@ -330,18 +337,53 @@ export class Agent {
 	// ------------------------------------------------------------ climbing
 	mode_climb(delta) {
 		const sim = this.sim;
+		this.chalking(delta);
 		// a job in hand (a shift, then a move) runs on the body each frame; the sim is stepped at 60 Hz
 		this.runJob(delta);
 		this.banked = Math.min(this.banked + delta, 0.25);
 		while (this.banked >= 1 / 60 && !sim.fallen) { sim.step(1 / 60); this.banked -= 1 / 60; }
 		this.pose = this.climber.climbPose(sim, -1, delta);
+		// a hand that catches a hold leaves a print on it and loses some chalk
+		for (const l of [2, 3]) {
+			if (this.latched[l] < 0 && sim.latch[l] >= 0 && sim.grips[l] >= 0 && sim.chalk[l] > 0.1) {
+				this.hooks?.dust?.(this.route.map(sim.tips[l], 6), 0.5);
+				if (this.hooks?.print?.(this.route, sim.grips[l], l === 2 ? -1 : 1, sim.chalk[l])) sim.chalk[l] = Math.max(0, sim.chalk[l] - 0.025);
+			}
+		}
+		this.latched = [...sim.latch];
 		const height = Math.max(sim.grips[2] >= 0 ? sim.holds()[sim.grips[2]].point.y : 0, sim.grips[3] >= 0 ? sim.holds()[sim.grips[3]].point.y : 0);
 		if (height > this.best + 0.05) { this.best = height; this.since = 0; } else this.since += delta;
 		if (sim.won) return this.send();
 		if (sim.fallen) return this.fall();
 		if (this.moves.length >= MOVES || this.since > STALL || this.flat >= FLAT) return this.giveUp();
-		if (!this.job && !this.thinking && sim.latch.every(v => v >= 0)) { this.idle += delta; if (this.idle > 0.45) this.decide(); } else this.idle = 0;
+		if (!this.job && !this.thinking && !this.chalkUp && sim.latch.every(v => v >= 0)) { this.idle += delta; if (this.idle > 0.45) this.decide(); } else this.idle = 0;
 		if (!this.thinking && !this.job) this.status = 'hanging on';
+	}
+
+	// chalking up: when a hand gets slick and the body is steady, the other hand and a foot hold on while it goes to the bag, then it goes back to its hold
+	chalking(delta) {
+		const sim = this.sim;
+		if (this.chalkUp) {
+			const job = this.chalkUp, dust = job.update(delta);
+			this.climber.chalking = job.state;
+			if (this.climber.mouth) for (const amount of dust) this.hooks?.dust?.(this.climber.mouth, amount);
+			if (job.chalked) sim.chalk[job.limb] = Math.min(1, sim.chalk[job.limb] + delta * 3);
+			if (job.done) {
+				this.chalkUp = null;
+				this.climber.chalking = null;
+				if (job.hold >= 0 && !sim.fallen) sim.grab(job.limb, job.hold);
+			}
+			return;
+		}
+		if (this.job || this.thinking || sim.fallen || !sim.latch.every(v => v >= 0)) return;
+		const hand = sim.chalk[2] <= sim.chalk[3] ? 2 : 3, other = hand === 2 ? 3 : 2;
+		const footing = [0, 1].some(f => (sim.grips[f] >= 0 || sim.smeared[f]) && sim.arrived(f));
+		if (sim.chalk[hand] < 0.3 && sim.grips[other] >= 0 && sim.arrived(other) && footing && sim.grips[hand] >= 0) {
+			this.chalkUp = new ChalkUp(hand, sim.grips[hand]);
+			sim.drop(hand);
+			this.status = 'chalking up';
+			this.say(['chalk time', 'dusting off my hands', 'a little powder never hurt'][Math.floor(Math.random() * 3)], 2.5);
+		}
 	}
 
 	runJob(delta) {
@@ -428,6 +470,8 @@ export class Agent {
 	}
 
 	send() {
+		this.chalkUp = null;
+		this.climber.chalking = null;
 		this.record('sent', 'sent');
 		this.status = 'SENT it';
 		this.say(['sent! put it on my tab', 'ha! take that, wall', 'smooth. very smooth.', 'and the crowd goes mild'][Math.floor(Math.random() * 4)], 4);
@@ -468,6 +512,8 @@ export class Agent {
 	}
 
 	fall() {
+		this.chalkUp = null;
+		this.climber.chalking = null;
 		const sim = this.sim, face = this.route, panel = face.at(sim.position.y);
 		this.record('fell', sim.hint);
 		this.status = `fell: ${sim.hint}`;
@@ -489,6 +535,8 @@ export class Agent {
 	}
 
 	giveUp(why) {
+		this.chalkUp = null;
+		this.climber.chalking = null;
 		this.record('gave up', why ?? (this.flat >= FLAT ? `stuck: no progress for ${this.flat} moves` : this.since > STALL ? 'no higher for a long time' : 'too many moves'));
 		this.status = 'jumping down to try again';
 		this.token++;

@@ -7,6 +7,8 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { toThree } from './gym.js';
+import { jointFrame, clampRel, measure, Editable, loadLimits } from './limits.js';
+import { ChalkBag } from './chalkbag.js';
 
 const V = THREE.Vector3, Q = THREE.Quaternion;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -39,18 +41,27 @@ const Curl = {
 const Fingers = ['Index', 'Mid', 'Ring', 'Pinky'];
 
 export class Figure {
-	static async load(url) {
-		const gltf = await new GLTFLoader().loadAsync(url);
-		return new Figure(gltf);
+	static async load(url, { limits = true } = {}) {
+		const [gltf, set] = await Promise.all([new GLTFLoader().loadAsync(url), limits ? loadLimits() : {}]);
+		const figure = new Figure(gltf);
+		figure.limits = set;
+		return figure;
 	}
 
 	constructor(gltf) {
 		this.root = gltf.scene;
 		this.root.updateMatrixWorld(true);
 		this.bones = {};
+		this.names = new Map();
+		// the joint limits from limits.json (see limits.js), the frame of each joint they are measured in, and how often each was held to its limit
+		this.limits = {};
+		this.frames = {};
+		this.hits = {};
+		// how far each joint has turned, over everything this character has done, by direction (see watch)
+		this.seen = {};
 		this.meshes = [];
 		this.root.traverse((o) => {
-			if (o.isBone) this.bones[o.name.replace('CC_Base_', '')] = o;
+			if (o.isBone) { this.bones[o.name.replace('CC_Base_', '')] = o; this.names.set(o, o.name.replace('CC_Base_', '')); }
 			if (o.isMesh) {
 				o.frustumCulled = false;
 				o.castShadow = true;
@@ -73,10 +84,82 @@ export class Figure {
 		this.eyeMeshes = this.meshes.filter(m => /Eye|Teeth/.test(m.name));
 		this.first = false;
 		this.checks = { hands: [0, 0] };
+		// a chalk bag on a belt, and the hands that go white when they are chalked
+		this.bag = new ChalkBag();
+		this.root.add(this.bag.group);
+		this.chalkUniforms = { uChalkR: { value: 0 }, uChalkL: { value: 0 } };
+		this.chalkHands();
 	}
 
+	// note how far every limitable joint has turned this frame, in each of the four directions and the twist: the editor can start a joint's limits from this
+	watch() {
+		for (const name of Editable) {
+			const bone = this.bones[name];
+			if (!bone) continue;
+			const frame = this.frames[name] ??= jointFrame(this, name);
+			if (!frame) continue;
+			const m = measure(inv(this.rest[name].local).multiply(bone.quaternion), frame);
+			const s = this.seen[name] ??= { fwd: 0, back: 0, out: 0, inn: 0, twist: [0, 0] };
+			const phi = m.phi * Math.PI / 180, c = Math.cos(phi), n = Math.sin(phi);
+			if (m.theta > 0.5) {
+				if (c > 0.38) s.fwd = Math.max(s.fwd, m.theta);
+				if (c < -0.38) s.back = Math.max(s.back, m.theta);
+				if (n > 0.38) s.out = Math.max(s.out, m.theta);
+				if (n < -0.38) s.inn = Math.max(s.inn, m.theta);
+			}
+			s.twist[0] = Math.min(s.twist[0], m.twist);
+			s.twist[1] = Math.max(s.twist[1], m.twist);
+		}
+	}
+
+	// new limits from the pose restriction editor, taking effect at the next frame
+	setLimits(set) { this.limits = set ?? {}; this.frames = {}; this.hits = {}; }
+
 	// the boxers take the shorts color from the outfit settings
-	tint({ shorts }) { if (shorts && this.materials.Boxers) this.materials.Boxers.color.set(shorts); }
+	tint({ shorts, shoes }) {
+		if (shorts && this.materials.Boxers) this.materials.Boxers.color.set(shorts);
+		// there are no shoes on the model, so the shoe color is the chalk bag's
+		if (shoes) this.bag.tint(shoes);
+	}
+
+	// how much chalk is on the right and left hand, 0 to 1: the hands go pale and dusty
+	setChalk(right, left) { this.chalkUniforms.uChalkR.value = right; this.chalkUniforms.uChalkL.value = left; }
+
+	// where the bag's mouth is, in three's meters
+	bagMouth() { return this.bag.mouth(); }
+
+	// a mask of how much of each skinned vertex belongs to the right and left hand and fingers, and the skin shaders that whiten it with the chalk
+	chalkHands() {
+		const uniforms = this.chalkUniforms;
+		// the body is one mesh a material (head, body, arms, legs, nails): each gets the mask and the shader
+		for (const mesh of this.meshes) {
+			const mat = [].concat(mesh.material)[0];
+			if (!mesh.skeleton || !mesh.geometry.attributes.skinIndex || !/^Std_(Skin|Nails)/.test(mat.name)) continue;
+			const bones = mesh.skeleton.bones;
+			const handBone = bones.map(b => { const n = b.name.replace('CC_Base_', ''); return /^[LR]_(Hand|Thumb\d|Index\d|Mid\d|Ring\d|Pinky\d)$/.test(n) ? n[0] : ''; });
+			const index = mesh.geometry.attributes.skinIndex, weight = mesh.geometry.attributes.skinWeight;
+			const right = new Float32Array(index.count), left = new Float32Array(index.count);
+			for (let v = 0; v < index.count; v++)
+				for (let k = 0; k < 4; k++) {
+					const side = handBone[index.getComponent(v, k)], w = weight.getComponent(v, k);
+					if (side === 'R') right[v] += w;
+					else if (side === 'L') left[v] += w;
+				}
+			mesh.geometry.setAttribute('aChalkR', new THREE.BufferAttribute(right, 1));
+			mesh.geometry.setAttribute('aChalkL', new THREE.BufferAttribute(left, 1));
+			mat.onBeforeCompile = (shader) => {
+				Object.assign(shader.uniforms, uniforms);
+				shader.vertexShader = shader.vertexShader
+					.replace('#include <common>', '#include <common>\nattribute float aChalkR;\nattribute float aChalkL;\nvarying float vChalkR;\nvarying float vChalkL;\nvarying vec2 vChalkUv;')
+					.replace('#include <begin_vertex>', '#include <begin_vertex>\nvChalkR = aChalkR; vChalkL = aChalkL; vChalkUv = uv;');
+				shader.fragmentShader = shader.fragmentShader
+					.replace('#include <common>', '#include <common>\nuniform float uChalkR;\nuniform float uChalkL;\nvarying float vChalkR;\nvarying float vChalkL;\nvarying vec2 vChalkUv;')
+					.replace('#include <map_fragment>', '#include <map_fragment>\n{ float n = fract(sin(dot(vChalkUv * 900.0, vec2(12.9898, 78.233))) * 43758.5453); float w = clamp(vChalkR * uChalkR + vChalkL * uChalkL, 0.0, 1.0) * 0.6 * (0.5 + 0.5 * n); diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.94, 0.93, 0.9), w); }');
+			};
+			mat.customProgramCacheKey = () => 'chalk-hands';
+			mat.needsUpdate = true;
+		}
+	}
 
 	// through the eyes: the head, lashes, eyes and teeth are not drawn (the camera sits just ahead of where the face was, so the open neck is behind it)
 	firstPerson(on) {
@@ -108,15 +191,31 @@ export class Figure {
 	}
 
 	// put a bone's world rotation (and, if given, position) where wanted; its children follow
+	// a local turn held to the joint's limits (limits.js); the turn itself if the bone has none or it is inside them
+	limit(name, local) {
+		const lim = this.limits[name];
+		if (!lim) return local;
+		const frame = this.frames[name] ??= jointFrame(this, name);
+		if (!frame) return local;
+		const rest = this.rest[name].local;
+		const out = clampRel(inv(rest).multiply(local), frame, lim);
+		if (!out.hit) return local;
+		this.hits[name] = (this.hits[name] ?? 0) + 1;
+		return rest.clone().multiply(out.q);
+	}
+
+	// returns the world rotation the bone ended up with, which is not the one asked for if a limit held it back
 	put(bone, world, position) {
 		const parent = bone.parent;
 		parent.updateWorldMatrix(true, false);
 		const pq = new Q();
 		parent.matrixWorld.decompose(new V(), pq, new V());
-		bone.quaternion.copy(pq.invert().multiply(world));
+		const local = this.limit(this.names.get(bone), inv(pq).multiply(world));
+		bone.quaternion.copy(local);
 		if (position) bone.position.copy(parent.worldToLocal(position.clone()));
 		bone.updateMatrix();
 		bone.matrixWorld.multiplyMatrices(parent.matrixWorld, bone.matrix);
+		return pq.multiply(local);
 	}
 
 	// the rotation the parent has made since rest, which carries a child along if it does nothing of its own
@@ -144,7 +243,8 @@ export class Figure {
 		side.normalize();
 		const middle = root.clone().addScaledVector(along, x).addScaledVector(side, y);
 		const wrist = root.clone().addScaledVector(along, reach);
-		const t1 = middle.clone().sub(root).normalize(), t2 = wrist.clone().sub(middle).normalize();
+		const t1 = middle.clone().sub(root).normalize();
+		let t2 = wrist.clone().sub(middle).normalize();
 		// the upper bone: the shortest turn from where its parent carries it, then rolled so the joint bends the way it does at rest
 		const rUp = this.rest[upperName], carriedUp = this.carried(upper);
 		const d0 = spin(this.dirOf(upperName, lowerName), carriedUp);
@@ -159,7 +259,11 @@ export class Figure {
 			const phi = Math.atan2(t1.dot(h.clone().cross(n)), h.dot(n));
 			qU = about(t1, phi * clamp((bend - 0.02) / 0.3, 0, 1)).multiply(qU);
 		}
-		this.put(upper, qU);
+		qU = this.put(upper, qU);
+		// the elbow or knee is wherever the upper bone, held to its limits, has put it: the lower bone aims at the target from there
+		lower.updateWorldMatrix(true, false);
+		const jointNow = new V().setFromMatrixPosition(lower.matrixWorld);
+		if (wrist.distanceToSquared(jointNow) > 1e-8) t2 = wrist.clone().sub(jointNow).normalize();
 		// the lower bone: carried by the upper, then the shortest turn onto its direction
 		const rLo = this.rest[lowerName];
 		const carriedLo = qU.clone().multiply(inv(rUp.q));
@@ -189,7 +293,12 @@ export class Figure {
 	}
 
 	// the pose is in unreal centimeters (see sim.js); Delta is the time since the last frame
-	apply(pose) {
+	apply(pose, delta = 0) {
+		this.applyPose(pose, delta);
+		this.watch();
+	}
+
+	applyPose(pose, delta = 0) {
 		const b = this.bones, rest = this.rest;
 		const [hipR, hipL, shoR, shoL] = pose.roots.map(point);
 		const pelvis = hipR.clone().add(hipL).multiplyScalar(0.5), chest = shoR.clone().add(shoL).multiplyScalar(0.5);
@@ -203,6 +312,7 @@ export class Figure {
 		const thighMid = rest.L_Thigh.p.clone().add(rest.R_Thigh.p).multiplyScalar(0.5);
 		const hipAt = pelvis.clone().add(spin(rest.Hip.p.clone().sub(thighMid), framePelvis));
 		this.put(b.Hip, framePelvis.clone().multiply(rest.Hip.q), hipAt);
+		this.bag.update(pelvis, framePelvis, delta);
 		// the spine turns from the pelvis frame to the chest frame, and the neck and head on to where the face looks
 		const mix = (a, c, t) => a.clone().slerp(c, t);
 		this.put(b.Waist, mix(framePelvis, frameChest, 0.35).multiply(rest.Waist.q));
@@ -263,7 +373,7 @@ export class Figure {
 			const key = `${side}_${name}${k}`, bone = this.bones[key], r = this.rest[key];
 			if (!bone) continue;
 			const axis = spin(hf.thumb0, inv(r.q));
-			bone.quaternion.copy(r.local).multiply(about(axis, rad(angles[k - 1]) * sign));
+			bone.quaternion.copy(this.limit(key, r.local.clone().multiply(about(axis, rad(angles[k - 1]) * sign))));
 			bone.updateMatrix();
 		}
 	}

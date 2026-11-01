@@ -194,3 +194,22 @@ body.menu-open #corner, body.menu-open .hud, body.menu-open #tip { display: none
 @media (pointer: coarse) { .keys { display: none; } }
 
 #ai { position: fixed; left: max(14px, env(safe-area-inset-left)); bottom: 74px; z-index: 9; font-size: var(--t-sm, 13px); max-width: min(560px, 90vw); pointer-events: none; }
+
+/* ---- the pose restriction editor */
+body.pose-editing .hud, body.pose-editing #corner, body.pose-editing #tip, body.pose-editing #ai, body.pose-editing #cross, body.pose-editing #bar, body.pose-editing #stick { display: none !important; }
+.pose-panel { position: fixed; right: 12px; top: 12px; bottom: 12px; width: min(350px, 92vw); overflow: auto; z-index: 40; padding: 14px; display: grid; gap: 10px; align-content: start; font-size: var(--t-sm, 13px); }
+.pose-head { display: flex; gap: 8px; align-items: center; } .pose-head b { flex: 1; font-size: 15px; }
+.pose-panel select { width: 100%; padding: 8px; border-radius: 10px; background: rgba(0, 0, 0, 0.35); color: inherit; border: 1px solid rgba(255, 255, 255, 0.15); }
+.pose-title { font-weight: 800; font-size: 17px; text-transform: capitalize; }
+.pose-axes { display: grid; gap: 10px; } .pose-axis { display: grid; gap: 5px; padding: 8px; border-radius: 10px; background: rgba(255, 255, 255, 0.05); }
+.pose-line { display: flex; gap: 6px; align-items: center; } .pose-line span:first-child { width: 42px; font-weight: 700; } .pose-now { flex: 1; opacity: 0.8; }
+.pose-num { width: 58px; padding: 5px; border-radius: 8px; background: rgba(0, 0, 0, 0.35); color: inherit; border: 1px solid rgba(255, 255, 255, 0.15); }
+.pose-bar { position: relative; height: 10px; border-radius: 5px; background: rgba(255, 255, 255, 0.1); }
+.pose-bar i { position: absolute; top: 0; bottom: 0; background: rgba(111, 207, 140, 0.55); border-radius: 5px; }
+.pose-bar b { position: absolute; top: -3px; width: 3px; height: 16px; margin-left: -1px; background: #f6d3bd; border-radius: 2px; }
+.pose-bar.over i { background: rgba(224, 89, 74, 0.6); }
+.pose-toggles { display: grid; gap: 4px; } .pose-toggles label { display: flex; gap: 8px; align-items: center; }
+.pose-actions { display: flex; flex-wrap: wrap; gap: 6px; } .pose-count { opacity: 0.75; }
+.pose-confirm { display: grid; gap: 8px; padding: 10px; border-radius: 10px; background: rgba(246, 211, 189, 0.12); }
+.pose-help { opacity: 0.6; margin: 0; line-height: 1.4; }
+.pose-now-line { padding: 6px 8px; border-radius: 8px; background: rgba(255, 255, 255, 0.06); line-height: 1.35; } .pose-now-line.over { background: rgba(224, 89, 74, 0.25); }

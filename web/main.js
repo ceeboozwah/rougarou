@@ -6,6 +6,10 @@ import { Sim, Vec2, Vec3, Names } from './sim.js';
 import { problems, buildGym, routeHolds, toThree, Overview, Focus, tape } from './gym.js';
 import { Figure } from './figure.js';
 import { Agent } from './agent.js';
+import { TheWall, DoorWay } from './thewall.js';
+import { PoseEditor } from './poseeditor.js';
+import { FormLab } from './formlab.js';
+import { Prints, ChalkUp } from './chalking.js';
 import { Brain, Memory } from './brain.js';
 import { Climber, walkPose, blend, handOn, solve, awayFromWall } from './climber.js';
 import { Ragdoll } from './ragdoll.js';
@@ -26,9 +30,13 @@ const mid = (a, b) => a.add(b).mul(0.5);
 const turn = (a, b, step) => { const gap = Math.atan2(Math.sin(b - a), Math.cos(b - a)); return a + clamp(gap, -step, step); };
 
 const routes = problems();
+// the last problem is The Wall, the one with no top (thewall.js): it is a problem like the rest to the sim, the tags and the walk, and is left out of the lists, the editor and the AI
+const theWall = new TheWall();
+routes.push(theWall.route);
 routes.forEach((r, i) => { r.tape = tape(i); });
 // the problems as set, for the route editor's reset
 const originals = problems();
+originals.push(theWall.route);
 const sim = new Sim(routes);
 // ?route=n skips the walk and starts on that problem
 const asked = parseInt(new URLSearchParams(location.search).get('route') ?? '', 10);
@@ -46,6 +54,9 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.92;
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x15151a);
+scene.add(theWall.group);
+// fog only matters in the wall's room, where the wall goes up out of sight; elsewhere it is far beyond the walls
+scene.fog = new THREE.Fog(0x15151a, 6000, 9000);
 const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 80);
 // saved route sets are loaded before anything is built from the holds
 const editor = new Editor(scene, routes, originals, { cursor: (x, y) => cursor(x, y), screenOf: (p) => screenOf(p), rebuild: (i) => rebuild(i), toast: (t, k) => ui.toast(t, k) });
@@ -100,6 +111,7 @@ const sets = routes.map(() => {
 	return group;
 });
 function rebuild(index) {
+	if (routes[index].endless) { if (spots) { spots[index] = world.startSpot(routes[index]); tags[index].position.copy(three(spots[index].at.add(Z.mul(255)))); } return; }
 	const group = sets[index];
 	for (const mesh of [...group.children]) { mesh.geometry.dispose(); mesh.material.dispose(); group.remove(mesh); }
 	const built = routeHolds(routes[index], index);
@@ -147,11 +159,21 @@ for (const l of gym.lights) {
 }
 
 const climber = new Climber(scene);
+// the form lab (F6): an AI that trains on realistic joint bending and learns limits
+const formLab = new FormLab({ toast: (t, k) => ui.toast(t, k), onApply: (set) => { climber.model?.setLimits(set); agent?.climber?.model?.setLimits(set); } });
+
+// the pose restriction editor (F3): joint limits for the characters, kept in limits.json and enforced on every skeleton
+const poseEd = new PoseEditor({ renderer, canvas, toast: (t, k) => ui.toast(t, k), onSaved: (set) => { climber.model?.setLimits(set); agent?.climber?.model?.setLimits(set); }, seen: () => climber.model?.seen });
 // the skinned character takes over from the tubes once it has loaded; ?tubes keeps the tubes, and so does a failed load
 if (!new URLSearchParams(location.search).has('tubes'))
 	Figure.load('./assets/character/climber.glb').then(f => { climber.wear(f); climber.model.root.visible = true; }).catch(e => console.warn('the character did not load, keeping the tubes', e));
 
 const world = new World(gym.blocks);
+const door = new DoorWay(scene, world);
+// a light that follows the climber up The Wall, so it is lit at any height
+const wallLight = new THREE.PointLight(0xfff3e2, 6, 16, 1.2);
+wallLight.visible = false;
+scene.add(wallLight);
 let spots = null;
 routes.forEach((_, i) => rebuild(i));
 // where to stand under each problem's start holds
@@ -201,7 +223,8 @@ const watching = { on: false };
 // what the human does is watched for the AI to learn from: a start, each hold a limb goes to, and how it ends (see Agent.watchStart)
 {
 	agent = new Agent({ scene, routes, spots, world, brain: new Brain(), memory: new Memory(),
-		hooks: { rebuild: (i) => rebuild(i), commit: (i, meta) => editor.commitRoute(i, meta), retag: (i) => retag(i), decor: () => gym.decorHolds, puff: (at) => chalk.puff(at, 10) } });
+		hooks: { rebuild: (i) => rebuild(i), commit: (i, meta) => editor.commitRoute(i, meta), retag: (i) => retag(i), decor: () => gym.decorHolds, puff: (at) => chalk.puff(at, 10),
+		print: (route, number, side, level) => prints.add(route, holdIndexOf(route, number), number, side, level), dust: (at, n) => chalk.dust(at, n) } });
 	const grab = sim.grab.bind(sim);
 	sim.grab = (limb, hold) => { const ok = grab(limb, hold); if (ok && mode === 'climb') agent.watchMove(limb, hold); return ok; };
 }
@@ -240,6 +263,23 @@ const chalk = (() => {
 				p.age = 0;
 				p.size = size * (0.6 + Math.random() * 0.8);
 				p.sprite.material.color.set(colors ? colors[i % colors.length] : 0xffffff);
+				p.g = 20;
+				p.faint = 1;
+				p.sprite.visible = true;
+			}
+		},
+		// a subtle powder puff: slow, drifting up and out, settling softly, fainter than a slap on a hold
+		dust(at, amount = 1) {
+			for (let i = 0; i < Math.round(5 * amount); i++) {
+				const p = pool[next++ % pool.length];
+				p.at = at.add(new Vec3((Math.random() - 0.5) * 3, (Math.random() - 0.5) * 3, 0));
+				p.v = new Vec3(Math.random() - 0.5, Math.random() - 0.5, 0.6 + Math.random() * 0.8).norm().mul(10 * (0.4 + Math.random()));
+				p.life = 1.3 + Math.random() * 1.1;
+				p.age = 0;
+				p.size = 3.2 * (0.7 + Math.random() * 0.8);
+				p.sprite.material.color.set(0xffffff);
+				p.g = 1.5;
+				p.faint = 0.55;
 				p.sprite.visible = true;
 			}
 		},
@@ -248,22 +288,31 @@ const chalk = (() => {
 				if (!p.sprite.visible) continue;
 				p.age += delta;
 				if (p.age >= p.life) { p.sprite.visible = false; continue; }
-				p.v = p.v.mul(1 / (1 + delta * 3)).add(new Vec3(0, 0, -20 * delta));
+				p.v = p.v.mul(1 / (1 + delta * 3)).add(new Vec3(0, 0, -(p.g ?? 20) * delta));
 				p.at = p.at.add(p.v.mul(delta));
 				const k = p.age / p.life;
 				p.sprite.position.copy(three(p.at));
 				p.sprite.scale.setScalar((p.size * (1 + k * 1.5)) / 100);
-				p.sprite.material.opacity = 0.55 * (1 - k);
+				p.sprite.material.opacity = 0.55 * (p.faint ?? 1) * (1 - k);
 			}
 		},
 	};
 })();
+
+// the prints chalked hands leave on the holds
+const prints = new Prints(scene);
+// chalking up: the hand that is doing it, and the job (see chalking.js)
+let chalkUp = null;
+sim.sweat = true;
+const holdIndexOf = (route, h) => route.holds[h]?.chunk ?? routes.indexOf(route);
 
 // ---------------------------------------------------------------- sound, the menu, clips
 
 const audio = new Audio();
 const ui = new UI(routes, {
 	play: () => { elapsed = 0; },
+	poseEditor: () => { ui.close(); poseEd.open(); },
+	formLab: () => { ui.close(); formLab.open(); },
 	pause: () => { if (document.pointerLockElement) document.exitPointerLock(); },
 	go: (index, pull) => goTo(index, pull),
 	edit: (index) => editRoute(index),
@@ -370,7 +419,7 @@ function holdInSight() {
 
 // send a hand or foot to the hold in the crosshair
 function sendLimb(l) {
-	if (mode !== 'climb') return;
+	if (mode !== 'climb' || chalkUp) return;
 	fp.side = '';
 	if (fp.hold < 0) { ui.toast('look at a hold first', 'warn'); return; }
 	limb = -1;
@@ -408,14 +457,16 @@ function cursor(px, py) {
 	const origin = unreal(ray.ray.origin), direction = unreal(ray.ray.direction).norm();
 	const face = routes[sim.route];
 	let nearest = Infinity, out = null;
-	face.panels.forEach((panel, index) => {
+	// on a wall with no top only the panels around the climber are asked, and nothing is an edge
+	const list = face.endless ? face.near(face.map(sim.position, 0)) : face.panels;
+	list.forEach((panel, index) => {
 		const facing = direction.dot(panel.out);
 		if (Math.abs(facing) < 1e-4) return;
 		const distance = panel.origin.sub(origin).dot(panel.out) / facing;
 		if (distance <= 0 || distance >= nearest) return;
 		const hit = origin.add(direction.mul(distance)).sub(panel.origin);
 		const up = hit.dot(panel.up) / 100;
-		if (!(index === 0 || up >= -0.05) || !(index + 1 === face.panels.length || up <= panel.length + 0.05)) return;
+		if (!((!face.endless && index === 0) || up >= -0.05) || !((!face.endless && index + 1 === list.length) || up <= panel.length + 0.05)) return;
 		nearest = distance;
 		out = new Vec2(hit.dot(panel.right) / 100, panel.start + up);
 	});
@@ -439,7 +490,23 @@ function pick(px, py) {
 	return best;
 }
 
+// chalk up: the hand with the least chalk, if the other hand and a foot can hold the body, lets go, reaches back to the bag, dips in and goes back to its hold
+function startChalk() {
+	if (mode !== 'climb' || chalkUp || sim.fallen) return;
+	const ready = (l) => sim.grips[l] >= 0 && sim.arrived(l);
+	const footing = [0, 1].some(f => (sim.grips[f] >= 0 || sim.smeared[f]) && sim.arrived(f));
+	const hands = [2, 3].sort((a, b) => sim.chalk[a] - sim.chalk[b]);
+	const hand = hands.find(h => ready(h === 2 ? 3 : 2) && (sim.grips[h] >= 0 || !sim.smeared[h]));
+	if (hand === undefined || !footing) { ui.toast('chalk up with one hand while the other and a foot hold you', 'warn'); return; }
+	if (limb >= 0) cancel();
+	chalkUp = new ChalkUp(hand, sim.grips[hand]);
+	sim.drop(hand);
+	ui.toast(`${hand === 2 ? 'right' : 'left'} hand to the chalk bag`, 'good');
+}
+function endChalk() { chalkUp = null; climber.chalking = null; }
+
 function lift(index) {
+	if (chalkUp) return;
 	// lifting a limb takes it off the wall: the other three carry the weight from this moment
 	limb = index;
 	previous = sim.grips[index];
@@ -573,6 +640,8 @@ function runStages(delta) {
 }
 
 function mount() {
+	endChalk();
+	sim.chalk = [1, 1, 1, 1];
 	if (document.pointerLockElement) document.exitPointerLock();
 	sim.route = walker.near;
 	sim.restart();
@@ -598,8 +667,25 @@ function stand(at) {
 	walker.near = sim.route;
 }
 
+// on The Wall a fall from a height is caught by an auto-belay that lowers you to the mats, not a ragdoll falling a hundred meters
+let lowering = null;
+function startLower() {
+	lowering = { t: 0, y0: sim.position.y, x: sim.position.x, T: clamp(sim.position.y / 5, 2.5, 8) };
+	sim.fallen = true;
+	for (let l = 0; l < 4; l++) sim.drop(l);
+	audio.slip();
+	note = 'the auto-belay catches you';
+	noted = 0;
+	mode = 'lower';
+	limb = -1;
+	drag = null;
+	joystick = null;
+}
+
 function startFall() {
+	endChalk();
 	agent?.watchEnd('fell', sim.hint);
+	if (routes[sim.route].endless && sim.position.y > 6) { startLower(); return; }
 	const face = routes[sim.route], panel = face.at(sim.position.y);
 	const velocity = panel.right.mul(sim.velocity.x * 100).add(panel.up.mul(sim.velocity.y * 100));
 	ragdoll = new Ragdoll(pose, velocity, face);
@@ -627,6 +713,7 @@ function getUp() {
 function jumpDown() {
 	if (mode !== 'climb') return;
 	agent?.watchEnd('left');
+	if (routes[sim.route].endless && sim.position.y > 6) { startLower(); return; }
 	const face = routes[sim.route], spot = spots[sim.route];
 	const hips = face.map(sim.position, 0);
 	const at = world.clear(new Vec3(hips.x, hips.y, 0).add(spot.out.mul(40)), spot.out);
@@ -642,6 +729,8 @@ function jumpDown() {
 
 function retry() {
 	if (mode !== 'climb' && mode !== 'fall') return;
+	endChalk();
+	sim.chalk = [1, 1, 1, 1];
 	agent?.watchEnd('left');
 	sim.restart();
 	climber.reset();
@@ -656,6 +745,8 @@ function retry() {
 function visit(step) {
 	const from = mode === 'walk' && walker.near < 0 ? sim.route : (walker.near >= 0 && mode === 'walk' ? walker.near : sim.route);
 	sim.route = (from + step + routes.length) % routes.length;
+	// The Wall is behind its own door: the problems in the gym come one after another without it
+	if (routes[sim.route].endless) sim.route = (sim.route + step + routes.length) % routes.length;
 	const spot = spots[sim.route];
 	stand(world.clear(spot.at.add(spot.out.mul(130)), spot.out));
 	stages = null;
@@ -668,6 +759,7 @@ function visit(step) {
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('pointerdown', (e) => {
+	if (poseEd.active) return;
 	canvas.setPointerCapture(e.pointerId);
 	Object.assign(pointer, { x: e.clientX, y: e.clientY, inside: true, touch: e.pointerType !== 'mouse' });
 	$('tip').classList.add('gone');
@@ -694,6 +786,7 @@ canvas.addEventListener('pointerdown', (e) => {
 		if (!looking) looking = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
 		return;
 	}
+	if (chalkUp) return;
 	if (e.button === 2) { cancel(); return; }
 	if (limb >= 0) { place(); return; }
 	const found = pick(e.clientX, e.clientY);
@@ -706,6 +799,7 @@ canvas.addEventListener('pointerdown', (e) => {
 	joystick = { x: e.clientX, y: e.clientY, dx: 0, dy: 0 };
 });
 canvas.addEventListener('pointermove', (e) => {
+	if (poseEd.active) return;
 	if (document.pointerLockElement === canvas) {
 		if (fpOn()) { fpLook(e.movementX * 0.0025 * ui.settings.look, e.movementY * 0.002 * ui.settings.look); return; }
 		camYaw += e.movementX * 0.0025 * ui.settings.look;
@@ -732,6 +826,7 @@ canvas.addEventListener('pointermove', (e) => {
 	if (joystick) { joystick.dx = e.clientX - joystick.x; joystick.dy = e.clientY - joystick.y; }
 });
 const release = (e) => {
+	if (poseEd.active) return;
 	if (mode === 'edit') editor.up();
 	if (stick && e.pointerId === stick.id) { stick = null; $('stick').hidden = true; $('stick').firstChild.style.transform = ''; }
 	if (looking && e.pointerId === looking.id) {
@@ -753,7 +848,12 @@ canvas.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') 
 
 addEventListener('keydown', (e) => {
 	const k = e.key.toLowerCase();
-	if (e.target.tagName === 'INPUT') return;
+	if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+	// F3, or Option + P where F keys are brightness and volume: the pose restriction editor
+	if (e.code === 'F3' || (e.altKey && e.code === 'KeyP')) { e.preventDefault(); if (poseEd.active) poseEd.close(); else { ui.close(); poseEd.open(); } return; }
+	// F6, or Option + J: the form lab
+	if (e.code === 'F6' || (e.altKey && e.code === 'KeyJ')) { e.preventDefault(); if (formLab.active) formLab.close(); else { ui.close(); formLab.open(); } return; }
+	if (poseEd.active || formLab.active) return;
 	if (e.code === 'Backquote') { recorder.toggle(); return; }
 	if (k === 'm' || (k === 'escape' && limb < 0 && mode !== 'edit')) { ui.toggle(); return; }
 	if (ui.open || recorder.view) return;
@@ -786,7 +886,8 @@ addEventListener('keydown', (e) => {
 	if (k === ']') visit(1);
 	if (k === '[') visit(-1);
 	if (k === 'g') wide = !wide;
-	if (k === 'e') pullOn();
+	if (k === 'c' && !e.repeat && mode === 'climb') { startChalk(); return; }
+	if (k === 'e') { if (mode === 'walk' && walker.near < 0 && door.near(walker.at)) { door.toggle(); audio.click(); } else pullOn(); }
 	if (k === 'j') jumpDown();
 	if (k === 'escape') { cancel(); fp.side = ''; }
 	if (k === 'x') letGo();
@@ -806,6 +907,7 @@ $('again').onclick = retry;
 $('onward').onclick = jumpDown;
 $('nextUp').onclick = () => goTo((sim.route + 1) % routes.length, true);
 $('fpBtn').onclick = toggleFirstPerson;
+$('chalkBtn').onclick = startChalk;
 $('watch').onclick = toggleWatch;
 $('fpRH').onclick = () => sendLimb(2);
 $('fpLH').onclick = () => sendLimb(3);
@@ -821,6 +923,7 @@ $('eReset').onclick = () => editor.reset();
 $('eDone').onclick = finishEdit;
 // the wheel turns a hold while setting, and otherwise pulls the camera in or out (saved with the settings)
 canvas.addEventListener('wheel', (e) => {
+	if (poseEd.active) return;
 	e.preventDefault();
 	if (mode === 'edit') { editor.turn(e.deltaY > 0 ? -10 : 10); return; }
 	ui.settings.zoom = clamp(ui.settings.zoom * Math.exp(e.deltaY * 0.0012), 0.45, 2);
@@ -898,6 +1001,19 @@ function walkerPose() {
 }
 
 function climb(delta) {
+	if (chalkUp) {
+		const dust = chalkUp.update(delta);
+		climber.chalking = chalkUp.state;
+		if (climber.mouth) for (const amount of dust) chalk.dust(climber.mouth, amount);
+		// the hand picks up its chalk as it goes in the bag
+		if (chalkUp.chalked) sim.chalk[chalkUp.limb] = Math.min(1, sim.chalk[chalkUp.limb] + delta * 3);
+		if (chalkUp.done) {
+			const hand = chalkUp.limb, hold = chalkUp.hold;
+			endChalk();
+			// and back to the hold it left, if the body can still reach it
+			if (hold >= 0 && !sim.fallen) sim.grab(hand, hold);
+		}
+	}
 	// the lifted hand or foot follows the pointer until the limb runs out of length; on a phone it rides a little above the finger
 	const point = pointer.inside ? cursor(pointer.x, pointer.y - (pointer.touch && drag ? 50 : 0)) : null;
 	if (point && limb >= 0) aim = sim.clamp(limb, point);
@@ -914,7 +1030,14 @@ function climb(delta) {
 	const face = routes[sim.route];
 	for (let l = 0; l < 4; l++) {
 		if (latched[l] < 0 && sim.latch[l] >= 0 && (sim.grips[l] >= 0 || sim.smeared[l])) {
-			if (l >= 2) { audio.grab(sim.latch[l]); if (sim.grips[l] >= 0) chalk.puff(face.map(sim.tips[l], 6)); }
+			if (l >= 2) {
+				audio.grab(sim.latch[l]);
+				if (sim.grips[l] >= 0) {
+					// chalk goes up in a puff and leaves a print, and takes some chalk off the hand
+					if (sim.chalk[l] > 0.1) chalk.puff(face.map(sim.tips[l], 6), Math.ceil(9 * sim.chalk[l]));
+					if (prints.add(face, holdIndexOf(face, sim.grips[l]), sim.grips[l], l === 2 ? -1 : 1, sim.chalk[l])) sim.chalk[l] = Math.max(0, sim.chalk[l] - 0.025);
+				}
+			}
 			else audio.step();
 		}
 		if (gripped[l] >= 0 && sim.grips[l] < 0 && l !== limb && !sim.fallen) audio.slip();
@@ -931,6 +1054,7 @@ let baseFov = 50;
 function resize() {
 	const w = innerWidth, h = innerHeight;
 	renderer.setSize(w, h, false);
+	poseEd?.resize();
 	camera.aspect = w / h;
 	// keep the unreal camera's 55 degree horizontal view in landscape; a tall phone gets a taller view instead
 	baseFov = camera.aspect >= 1 ? THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(27.5)) / camera.aspect)) : 64;
@@ -944,6 +1068,7 @@ let behind = new Vec3(1, 0, 0);
 let view = Overview, look = Focus;
 let banked = 0, last = performance.now();
 const bars = [$('pumpL'), $('pumpR')];
+const chalkBars = [$('chalkL'), $('chalkR')];
 const loads = [0, 1, 2, 3].map(i => $(`load${i}`));
 const show = (id, on) => { $(id).hidden = !on; };
 
@@ -955,6 +1080,7 @@ function frame(now) {
 }
 
 function update(real) {
+	if (poseEd.active) { poseEd.frame(); return; }
 	// the menu and the clip viewer pause the climb; the gym keeps drawing behind them
 	const paused = ui.open || !!recorder.view;
 	const delta = paused ? 0 : Math.min(real, 0.1);
@@ -970,11 +1096,37 @@ function update(real) {
 		pose = ragdoll.pose();
 		if (ragdoll.landed && !landed) { landed = true; audio.thud(); chalk.puff(mid(pose.roots[0], pose.roots[1]), 12, ['#2a2a2e'], 60, 14); }
 		if (ragdoll.settled() || ragdoll.time > 3.5) getUp();
+	} else if (mode === 'lower') {
+		// hanging in the harness, let down the wall to the mats; it is quick from a great height
+		lowering.t += delta;
+		const k = Math.min(1, lowering.t / lowering.T), e = k * k * (3 - 2 * k);
+		sim.position = new Vec2(lowering.x, lowering.y0 + (1.15 - lowering.y0) * e);
+		sim.velocity = new Vec2();
+		for (let l = 0; l < 4; l++) sim.tips[l] = sim.hang(l);
+		pose = climber.climbPose(sim, -1, delta);
+		if (k >= 1) getUp();
 	} else if (stages) runStages(delta);
 	// the setter's view is the wall alone
 	climber.group.visible = mode !== 'edit';
 	climber.draw(pose);
 	chalk.step(delta);
+	// The Wall: grown and drawn around whoever is on it, with a light that goes up with them, fog inside its room
+	door.update(delta);
+	climber.model?.setChalk(sim.chalk[2], sim.chalk[3]);
+	if (agent?.climber?.model) agent.climber.model.setChalk(agent.sim.chalk[2], agent.sim.chalk[3]);
+	{
+		const onWall = routes[sim.route].endless && ['climb', 'mount', 'lower', 'fall', 'hop', 'rise', 'cheer'].includes(mode);
+		const inRoom = camera.position.z > 25.7;
+		if (onWall) {
+			theWall.update(Math.max(1.7, sim.position.y), mode === 'lower');
+			if (mode === 'climb' || mode === 'lower') theWall.record(theWall.heightOf(sim.position));
+			const slab = routes[sim.route].at(sim.position.y), hips = mid(pose.roots[0], pose.roots[1]);
+			wallLight.position.copy(three(hips.add(slab.out.mul(260)).add(Z.mul(70))));
+		} else if (inRoom) theWall.update(1.7);
+		wallLight.visible = onWall;
+		scene.fog.near = inRoom ? 18 : 6000;
+		scene.fog.far = inRoom ? 70 : 9000;
+	}
 	if (agent) {
 		agent.player = { mode, route: sim.route, at: walker.at, yaw: walker.yaw, heading: walker.heading, pos: sim.position };
 		agent.update(delta);
@@ -1025,7 +1177,7 @@ function update(real) {
 		goal = middle.add(flat.mul(Math.max(560, top * 130) * (tall ? 1.5 : 1))).add(Z.mul(40)).add(face.panels[0].right.mul(face.aside));
 		speed = 3;
 	} else {
-		const panel = face.at(mode === 'climb' ? sim.position.y : 1.2);
+		const panel = face.at(mode === 'climb' || mode === 'lower' ? sim.position.y : 1.2);
 		const out = new Vec3(panel.out.x, panel.out.y, 0);
 		// under a roof the panel faces the floor; keep the last good direction
 		if (out.len() > 0.3) behind = out.norm();
@@ -1101,7 +1253,7 @@ function update(real) {
 		$('grade').lastChild.textContent = shown.grade;
 		$('grade').style.setProperty('--tape', `rgb(${shown.tape.map(c => Math.round(c * 255)).join(',')})`);
 	}
-	$('timer').textContent = climbing && started ? clock(finished || climber.clock - started) : '';
+	$('timer').textContent = shown?.endless && (climbing || mode === 'lower') ? `${theWall.height.toFixed(1)} m · best ${theWall.best.toFixed(1)} m` : climbing && started ? clock(finished || climber.clock - started) : '';
 	$('timer').classList.toggle('done', !!finished);
 	const sliding = Math.max(sim.strain[2], sim.strain[3]) > 0.9;
 	let status;
@@ -1109,8 +1261,9 @@ function update(real) {
 	else if (mode === 'fall') status = note;
 	else if (fpOn() && fp.side && performance.now() - fp.at < SIDE_WAIT) status = `${fp.side === 'r' ? 'right' : 'left'}: a for the arm, l for the leg`;
 	else if (fpOn() && fp.hold >= 0 && limb < 0 && !sim.latch.some(v => v < 0)) status = `${sim.holds()[fp.hold].kind}: r or l, then a (arm) or l (leg)`;
-	else if (climbing) status = limb >= 0 ? `${Names[limb]} off the wall` : sliding ? 'fingers sliding: get your feet under you' : sim.topped > 0 && !sim.won ? 'matched the top, hold it...' : (sim.hint || 'pick a hand or foot');
+	else if (climbing) status = limb >= 0 ? `${Names[limb]} off the wall` : sliding ? 'fingers sliding: get your feet under you' : (Math.min(sim.chalk[2], sim.chalk[3]) < 0.25 && !chalkUp) ? 'hands are slick: press c to chalk up' : sim.topped > 0 && !sim.won ? 'matched the top, hold it...' : (sim.hint || 'pick a hand or foot');
 	else if (note && noted < 4) status = note;
+	else if (mode === 'walk' && !near && door.near(walker.at)) status = door.want ? 'press e to close the door' : 'press e to open the door: THE WALL, how high can you go?';
 	else if (near) {
 		const r = ui.stats[near.name];
 		const record = r?.sends ? ` · best ${clock(r.best)}` : '';
@@ -1119,6 +1272,8 @@ function update(real) {
 	$('status').textContent = status;
 	$('status').classList.toggle('warn', (climbing && sliding && limb < 0) || mode === 'fall');
 	show('gauges', climbing && ui.settings.gauges);
+	chalkBars[0].style.width = `${sim.chalk[3] * 100}%`;
+	chalkBars[1].style.width = `${sim.chalk[2] * 100}%`;
 	bars[0].style.width = `${sim.pump[3] * 100}%`;
 	bars[1].style.width = `${sim.pump[2] * 100}%`;
 	const total = sim.loads.reduce((a, b) => a + b, 0) || 1;
@@ -1128,6 +1283,7 @@ function update(real) {
 	show('drop', mode === 'climb' && limb < 0);
 	show('retry', mode === 'climb' || mode === 'fall');
 	show('fpBtn', mode === 'climb');
+	show('chalkBtn', mode === 'climb');
 	show('watch', !!agent?.on);
 	$('watch').textContent = watching.on ? 'back to me' : 'watch the ai';
 	$('ai').hidden = !agent?.on;
@@ -1135,7 +1291,7 @@ function update(real) {
 	$('fpBtn').textContent = fp.want ? 'third person' : 'first person';
 	for (const id of ['fpRH', 'fpLH', 'fpRF', 'fpLF']) show(id, fpOn());
 	show('pull', mode === 'walk' && !!near);
-	show('edit', mode === 'walk' && !!near && !touchy);
+	show('edit', mode === 'walk' && !!near && !near.endless && !touchy);
 	show('prev', mode === 'walk');
 	show('next', mode === 'walk');
 	const locked = document.pointerLockElement === canvas;
@@ -1157,6 +1313,6 @@ else { walker.near = -1; pose = walkerPose(); }
 $('loading').remove();
 requestAnimationFrame(frame);
 // a handle for poking at the game from the console
-window.rougarou = { agent, watching, camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
+window.rougarou = { formLab, prints, poseEd, agent, watching, camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
 	// run the game forward without waiting on the browser's frame clock
 	tick: (seconds) => { for (let t = 0; t < seconds; t += 1 / 60) update(1 / 60); } };

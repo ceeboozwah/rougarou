@@ -26,13 +26,15 @@ export function startsHold(route) {
 }
 
 // climb it with rehearsal, from the start holds, as far as it goes. Resolves { sent, moves, trace, stuck }
-export async function solve(route, { maxMoves = 32, yieldEvery = 1 } = {}) {
+export async function solve(route, { maxMoves = 32, yieldEvery = 1, finish } = {}) {
 	const sim = new Sim([route]);
 	sim.restart();
 	const trace = [];
 	const recent = [];
 	let flat = 0, best = score(sim), peakPump = 0;
-	for (let move = 0; move < maxMoves && !sim.won && !sim.fallen; move++) {
+	// a climb is done when the sim says the problem is sent, or when a finish the caller names is true
+	const done = () => sim.won || (finish ? finish(sim) : false);
+	for (let move = 0; move < maxMoves && !done() && !sim.fallen; move++) {
 		const options = rehearse(sim, { max: 20 });
 		const fresh = options.filter(c => c.safe && !recent.includes(`${c.limb}:${c.hold}`));
 		const choice = fresh.find(c => c.gain > 0.01) ?? fresh[0];
@@ -52,7 +54,7 @@ export async function solve(route, { maxMoves = 32, yieldEvery = 1 } = {}) {
 		if (flat > 12) return { sent: false, moves: move + 1, trace, stuck: stuckAt(sim, options), sim };
 		if (move % yieldEvery === 0) await pause();
 	}
-	return { sent: sim.won, moves: trace.length, trace, stuck: sim.won ? null : stuckAt(sim, []), sim, peakPump };
+	return { sent: done(), moves: trace.length, trace, stuck: done() ? null : stuckAt(sim, []), sim, peakPump };
 }
 
 // where a climb stopped, in words for the setter: the height reached and which holds were close

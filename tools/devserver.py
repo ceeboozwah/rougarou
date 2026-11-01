@@ -8,7 +8,7 @@ the key is read from the environment here and never sent to the browser. POST /a
 endpoint (json answers only) and refuses after AI_MAX_CALLS calls in one run, a hard stop on the bill. GET /ai/status says whether a key is set.
 GET and POST /ai/memory keep the climber's notebook in tools/.cache/ai-memory.json. only this machine can use /ai/*.
 """
-import http.server, json, os, sys, functools, urllib.request, urllib.error, threading
+import http.server, json, os, re, sys, functools, urllib.request, urllib.error, threading
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'web')
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache')
@@ -45,6 +45,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             raise ValueError('too large')
         return json.loads(self.rfile.read(n) or b'{}')
 
+    def save_limits(self):
+        # the pose restriction editor's save: web/limits.json, one joint to a line, only from this machine and only a well formed set
+        if not self.local():
+            return self.reply(403, {'error': 'local only'})
+        try:
+            data = self.body()
+            limits = data['limits']
+            assert isinstance(limits, dict) and len(limits) < 200
+            for name, entry in limits.items():
+                assert re.fullmatch(r'[LR]?_?[A-Za-z0-9]{2,20}', name)
+                assert isinstance(entry, dict) and set(entry) <= {'fwd', 'back', 'out', 'inn', 'twist'}
+                for axis, value in entry.items():
+                    if axis == 'twist':
+                        assert isinstance(value, list) and len(value) == 2 and all(isinstance(v, (int, float)) and -360 <= v <= 360 for v in value) and value[0] <= value[1]
+                    else:
+                        assert isinstance(value, (int, float)) and 0 <= value <= 180
+        except Exception:
+            return self.reply(400, {'error': 'that is not a set of joint limits'})
+        path = os.path.join(ROOT, 'limits.json')
+        os.makedirs(os.path.join(CACHE, 'limit-backups'), exist_ok=True)
+        if os.path.exists(path):
+            import shutil, time
+            shutil.copy(path, os.path.join(CACHE, 'limit-backups', f'limits-{int(time.time())}.json'))
+        lines = ',\n'.join(f'  {json.dumps(k)}: {json.dumps(limits[k], separators=(",", ":"))}' for k in sorted(limits))
+        with open(path + '.tmp', 'w') as f:
+            f.write('{"version": 1, "limits": {\n' + lines + '\n}}\n')
+        os.replace(path + '.tmp', path)
+        return self.reply(200, {'ok': True, 'joints': len(limits)})
+
     def do_GET(self):
         if self.path == '/ai/status':
             if not self.local(): return self.reply(403, {'error': 'local only'})
@@ -58,6 +87,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if self.path == '/dev/limits':
+            return self.save_limits()
         if not self.path.startswith('/ai/') or not self.local():
             return self.reply(403, {'error': 'not allowed'})
         try:

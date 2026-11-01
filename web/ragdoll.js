@@ -73,7 +73,7 @@ export class Ragdoll {
 		const floor = floorAt(p.x, p.y) + r;
 		if (p.z < floor) p = new Vec3(p.x, p.y, floor);
 		// the wall the body came off stays solid behind it
-		for (const panel of this.route.panels) {
+		for (const panel of this.route.near ? this.route.near(p) : this.route.panels) {
 			const rel = p.sub(panel.origin);
 			const along = rel.dot(panel.up);
 			if (along < -20 || along > panel.length * 100 + 20) continue;

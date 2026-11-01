@@ -94,6 +94,8 @@ export class Sim {
 		this.route = 0;
 		this.falls = 0;
 		this.hint = '';
+		// sweat: hands wear their chalk off and slick hands grip worse. off for the solvers (they climb a hundred meters in a minute) and on for a body being played
+		this.sweat = false;
 		this.lean = new Vec2();
 		this.reaching = -1;
 		this.target = new Vec2();
@@ -105,7 +107,8 @@ export class Sim {
 		const c = new Sim(this.routes);
 		c.route = this.route;
 		for (const k of ['position', 'velocity', 'lean', 'goal', 'target']) c[k] = this[k].copy();
-		for (const k of ['grips', 'smeared', 'slips', 'pump', 'latch', 'strain', 'loads']) c[k] = [...this[k]];
+		for (const k of ['grips', 'smeared', 'slips', 'pump', 'latch', 'strain', 'loads', 'chalk']) c[k] = [...this[k]];
+		c.sweat = this.sweat;
 		c.posts = this.posts.map(p => p.copy());
 		c.tips = this.tips.map(p => p.copy());
 		for (const k of ['angle', 'spin', 'won', 'topped', 'reaching', 'squeeze', 'tipping', 'fallen', 'falls', 'hint']) c[k] = this[k];
@@ -171,6 +174,8 @@ export class Sim {
 		this.latch = [1, 1, 1, 1];
 		this.strain = [0, 0, 0, 0];
 		this.tips = [0, 1, 2, 3].map(l => this.holds()[l].point.copy());
+		// how much chalk is on each hand, 1 fresh from the bag to 0 bare (only the hands count): it wears off, and slick hands hold less
+		this.chalk = [1, 1, 1, 1];
 		this.won = false;
 		this.topped = 0;
 		this.reaching = -1;
@@ -380,7 +385,7 @@ export class Sim {
 			const peel = steep > 0 ? 1 - steep * (limb < 2 ? 0.7 : 0.45) : 1 - steep * (limb < 2 ? 0.3 : 0);
 			// a fresh catch has not settled yet: the fingers are still finding the hold
 			const limit = c.press ? friction(limb) * (0.45 + 0.55 * this.latch[limb])
-				: grip * (0.5 + 0.5 * matchup) * (limb < 2 ? 1.45 : 1) * (1 - 0.5 * this.pump[limb]) * peel * (0.45 + 0.55 * this.latch[limb]);
+				: grip * (0.5 + 0.5 * matchup) * (limb < 2 ? 1.45 : 1) * (1 - 0.5 * this.pump[limb]) * peel * (0.45 + 0.55 * this.latch[limb]) * (limb >= 2 && this.sweat ? 0.8 + 0.2 * this.chalk[limb] : 1);
 			const effort = load.len() / Math.max(limit, 1);
 			this.strain[limb] = effort;
 			this.loads[limb] = load.len();
@@ -397,6 +402,11 @@ export class Sim {
 			this.hint = c.press ? `${Names[limb]} skated off: bare wall needs weight pressing it in` : `${Names[limb]} slipped: adjust your weight`;
 		}
 		for (let limb = 0; limb < 4; limb++) if (!contacts.some(c => c.limb === limb)) this.loads[limb] = 0;
+
+		// a hand on a hold sweats its chalk away, faster under load and when pumped
+		if (this.sweat)
+			for (let limb = 2; limb < 4; limb++)
+				if (this.grips[limb] >= 0 && this.arrived(limb)) this.chalk[limb] = Math.max(0, this.chalk[limb] - delta * (0.006 + 0.03 * Math.min(1, this.strain[limb]) + 0.02 * this.pump[limb]));
 
 		// a hand off the wall shakes out
 		for (let limb = 2; limb < 4; limb++)
@@ -415,6 +425,6 @@ export class Sim {
 		const top = holds.length - 1;
 		// a send is both hands matched on the finish hold, held under control
 		this.topped = this.grips[2] === top && this.grips[3] === top && this.arrived(2) && this.arrived(3) ? this.topped + delta : 0;
-		if (this.topped > 0.5) this.won = true;
+		if (this.topped > 0.5 && !face.endless) this.won = true;
 	}
 }

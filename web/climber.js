@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { Vec2, Vec3 } from './sim.js';
 import { toThree } from './gym.js';
 import { Tube, bent } from './tube.js';
+import { Bag } from './chalkbag.js';
 
 const Gap = 30;
 const Skin = 0xc98e6d, Tee = 0xe6dfcc, Shorts = 0x3f4a2c, Shoe = 0xe9b812, Sole = 0x161616, Hair = 0x4a3324, Beard = 0x8a5634;
@@ -35,7 +36,7 @@ export function handOn(frame, contact, over, side, grip, shake = 0) {
 // push a point out of the wall it sits near, so a limb or the eyes never poke through a panel. Min is the clearance in centimeters
 export function awayFromWall(face, p, min) {
 	let out = p;
-	for (const panel of face.panels) {
+	for (const panel of face.near ? face.near(p) : face.panels) {
 		const along = p.sub(panel.origin).dot(panel.up) / 100 + panel.start;
 		if (along < panel.start - 0.15 || along > panel.start + panel.length + 0.15) continue;
 		const depth = out.sub(panel.origin).dot(panel.out);
@@ -455,6 +456,18 @@ export class Climber {
 			limbs.push({ ...part, pole });
 			if (limb === selected) marker = contact;
 		}
+		// chalking up: one hand reaches behind to the bag on the small of the back and dips into it
+		if (this.chalking) {
+			const k = this.chalking, hand = k.limb;
+			const mouth = pelvis.add(frame.out.mul(Bag.back)).add(up.mul(Bag.up));
+			this.mouth = mouth;
+			const wrist = mouth.add(up.mul(2.5 - 3.5 * k.dip));
+			const over = up.mul(-1);
+			const flat = roots[hand].sub(chest);
+			const outward = flat.sub(up.mul(flat.dot(up))).norm();
+			const target = { end: wrist, pole: frame.out.mul(0.6).add(outward.mul(0.8)).sub(up.mul(0.3)), hand: { palm: wrist.add(over.mul(5.5)), over, out: outward, thumb: frame.out.mul(-1), grip: 'free' } };
+			limbs[hand] = blend(limbs[hand], target, k.reach);
+		}
 		const posed = solve({ roots, up, back: frame.out, head, look: this.look, limbs, marker });
 		// elbows and knees stay out of the wall, so the arms and legs never sink into it
 		posed.limbs.forEach((l, i) => { if (l.bend) l.bend = awayFromWall(face, l.bend, i < 2 ? 11 : 7.5); });
@@ -515,8 +528,9 @@ export class Climber {
 
 	draw(pose) {
 		if (this.model) {
+			const dt = this.clock - this.drawn;
 			this.drawn = this.clock;
-			this.model.apply(pose);
+			this.model.apply(pose, dt);
 			this.marker.visible = !!pose.marker;
 			if (pose.marker) this.marker.position.copy(three(pose.marker));
 			return;

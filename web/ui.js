@@ -53,6 +53,7 @@ export class UI {
 	points() {
 		let total = 0, sent = 0;
 		for (const route of this.routes) {
+			if (route.endless) continue;
 			const r = this.stats[route.name];
 			if (!r?.sends) continue;
 			sent++;
@@ -96,7 +97,7 @@ export class UI {
 
 	render() {
 		const { total, sent } = this.points();
-		$('score').innerHTML = `<b>${total} pts</b>${sent}/${this.routes.length} problems sent`;
+		$('score').innerHTML = `<b>${total} pts</b>${sent}/${this.routes.filter(r => !r.endless).length} problems sent`;
 		$('play').textContent = this.started ? 'back to the gym' : 'walk into the gym';
 		$('menuNote').textContent = this.started ? '' : 'tip: walk up to a problem and grab its two start holds to pull on.';
 		if (this.tab === 'problems') this.problems();
@@ -106,11 +107,12 @@ export class UI {
 	problems() {
 		$('problems').innerHTML = this.routes.map((route, i) => {
 			const r = this.stats[route.name];
-			const line = r?.sends ? `sent ${r.sends}x · best ${clock(r.best)}${r.flashed ? ' · flashed' : ''}` : r?.attempts ? `${r.attempts} ${r.attempts === 1 ? 'try' : 'tries'}, not sent yet` : 'not tried yet';
+			const best = (() => { try { return Number(JSON.parse(localStorage.getItem('rougarou-wall') || '{}').best) || 0; } catch { return 0; } })();
+			const line = route.endless ? (best ? `no top: your best is ${best.toFixed(1)} m` : 'no top: a door in the east wall of the gym') : r?.sends ? `sent ${r.sends}x · best ${clock(r.best)}${r.flashed ? ' · flashed' : ''}` : r?.attempts ? `${r.attempts} ${r.attempts === 1 ? 'try' : 'tries'}, not sent yet` : 'not tried yet';
 			return `<article class="problem ${r?.sends ? 'sent' : ''}" style="--tape:${hex(route.tape)}">
 				<div class="head"><b>${route.name}</b>${route.edited ? '<span class="chip">your set</span>' : ''}<span class="grade">${route.grade}</span></div>
 				<small>${line}</small>
-				<div class="go"><button class="primary" data-pull="${i}">climb it</button><button data-walk="${i}">walk there</button><button class="ghost" data-edit="${i}">set it</button></div>
+				<div class="go"><button class="primary" data-pull="${i}">climb it</button><button data-walk="${i}">walk there</button>${route.endless ? '' : `<button class="ghost" data-edit="${i}">set it</button>`}</div>
 			</article>`;
 		}).join('');
 		for (const b of $('problems').querySelectorAll('button')) {
@@ -143,6 +145,7 @@ export class UI {
 			<div><h3>ai climber</h3><div class="field"><label>second climber</label>${toggle('ai', [[false, 'off'], [true, 'on']])}</div>
 				<div class="field"><label>how it plays</label>${toggle('aimode', [['rehearse', 'climbs: rehearses'], ['blind', 'climbs: hard'], ['watch', 'watches me'], ['set', 'sets routes']])}</div>
 				<div class="field"><small>an AI that tours the gym and climbs from the easiest problem up, asking OpenAI for each move through tools/devserver.py (needs OPENAI_API_KEY set there; without it, it rehearses on its own). press b to watch it. "watches me" keeps it beside you while you climb, learning from what you do, and it uses that next time it climbs.</small></div></div>
+			<div><h3>tools</h3><div class="field"><button id="poseTool">pose restriction editor</button><small>set how far every joint of the characters may bend, swing and twist, with a gimbal on each one (F3, or Option + P)</small></div><div class="field"><button id="formTool">form lab (AI joint training)</button><small>an AI that trains on realistic bending, flexion and rotation, then learns limits (F6, or Option + J)</small></div></div>
 			<div><h3>progress</h3><div class="field"><button class="ghost danger" id="wipe">reset my tick list</button></div></div>`;
 		const el = $('settings');
 		const apply = () => { this.save(); this.hooks.apply(this.settings); };
@@ -155,6 +158,8 @@ export class UI {
 			apply();
 			this.form();
 		};
+		$('poseTool').onclick = () => this.hooks.poseEditor?.();
+		$('formTool').onclick = () => this.hooks.formLab?.();
 		const wipe = $('wipe');
 		wipe.onclick = () => {
 			if (!wipe.dataset.armed) { wipe.dataset.armed = '1'; wipe.textContent = 'really clear every send?'; return; }

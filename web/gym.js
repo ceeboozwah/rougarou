@@ -125,6 +125,9 @@ export function problems() {
 export const Tapes = [[0.95, 0.62, 0.02], [0.02, 0.25, 0.8], [0.05, 0.45, 0.15], [0.8, 0.05, 0.05], [0.45, 0.12, 0.75],
 	[0.95, 0.35, 0.02], [0.9, 0.3, 0.55], [0.02, 0.55, 0.6], [0.85, 0.85, 0.82], [0.35, 0.75, 0.1]];
 export const tape = (i) => Tapes[i % Tapes.length];
+// the room behind the front wall where The Wall stands (see thewall.js): a door in the front wall at y 0, and a room 18 m deep and 18 m wide
+export const Door = { x: 2560, y: 0, width: 130, height: 215 };
+export const Room = { x0: 2570, x1: 4400, half: 900 };
 export const Overview = V(2450, 1100, 600);
 export const Focus = V(1300, 100, 170);
 
@@ -404,7 +407,20 @@ export function buildGym(routes) {
 	block(V(-300, 0, 450), V(20, 3500, 900), siding, false);
 	block(V(1150, -1650, 450), V(2900, 20, 900), siding, false);
 	block(V(1150, 1650, 450), V(2900, 20, 900), siding, false);
-	block(V(2560, 0, 450), V(20, 3300, 900), siding, false);
+	// the front wall, with a doorway in it for The Wall: a piece each side and one over the top
+	{
+		const gap = Door.width / 2;
+		block(V(2560, (-1650 - gap) / 2, 450), V(20, 1650 - gap, 900), siding, false);
+		block(V(2560, (1650 + gap) / 2, 450), V(20, 1650 - gap, 900), siding, false);
+		block(V(2560, 0, (Door.height + 900) / 2), V(20, Door.width, 900 - Door.height), siding, false);
+	}
+	// the room: black mats, a slab under them, tall steel-sided walls (a kilometre of them: the wall inside has no top)
+	for (let x = 2670; x < 4400; x += 200)
+		for (let y = -850; y < 900; y += 100) block(V(x, y, 14), V(196, 97, 28), [0.03, 0.03, 0.035]);
+	block(V((2570 + 4400) / 2, 0, -5), V(1830, 1800, 10), [0.25, 0.25, 0.25], false);
+	block(V((2570 + 4400) / 2, -910, 50000), V(1830, 20, 100000), siding, false);
+	block(V((2570 + 4400) / 2, 910, 50000), V(1830, 20, 100000), siding, false);
+	block(V(4450, 0, 50000), V(40, 1840, 100000), [0.05, 0.05, 0.055], false);
 	block(V(1150, 0, 915), V(2950, 3400, 20), [0.72, 0.66, 0.55], false);
 	for (let x = -200; x <= 2400; x += 520) block(V(x, 0, 870), V(30, 3300, 60), steel, false);
 	for (let y = -1200; y <= 1200; y += 600) block(V(1150, y, 896), V(2900, 14, 14), steel, false);
@@ -498,7 +514,7 @@ export function buildGym(routes) {
 
 // one problem's holds in its tape color, turned so each lip faces away from the way it is pulled. built apart from the gym
 // so the route editor can rebuild a problem after moving its holds. a hold's Seed keeps its shape when holds are added or removed
-export function routeHolds(problem, index) {
+export function routeHolds(problem, index, fine = true) {
 	const body = new Sink(), dark = new Sink();
 	problem.holds.forEach((spot, h) => {
 		// a hold the setter has taken off the wall and is carrying is not on it
@@ -506,9 +522,23 @@ export function routeHolds(problem, index) {
 		const face = problem.at(spot.point.y);
 		const up = face.right.mul(-spot.pull.x).add(face.up.mul(-spot.pull.y));
 		const seed = spot.seed ?? h;
-		buildHold(pickTemplate(spot.kind, index * 31 + seed), holdSize(spot.kind), holdFrame(problem.map(spot.point), face.out, up), index * 977 + seed, body, dark, true);
+		buildHold(pickTemplate(spot.kind, index * 31 + seed), holdSize(spot.kind), holdFrame(problem.map(spot.point), face.out, up), index * 977 + seed, body, dark, fine);
 	});
 	return { body, dark, color: tape(index) };
+}
+
+// where a problem's hold is and which way it faces, for things that go on it (chalk prints): the same template, size and frame routeHolds builds it with.
+// at is the middle of its foot on the wall; Top the way the fingers point over its lip, Side across it, Out away from the wall; Scale its three half sizes in centimeters
+export function holdInfo(problem, spot, index, h = 0) {
+	const face = problem.at(spot.point.y);
+	const up = face.right.mul(-spot.pull.x).add(face.up.mul(-spot.pull.y));
+	const seed = spot.seed ?? h;
+	const template = Templates[pickTemplate(spot.kind, index * 31 + seed)];
+	const size = holdSize(spot.kind);
+	const out = face.out.norm();
+	let top = up.sub(out.mul(up.dot(out))).norm();
+	if (top.nearZero()) top = V(1, 0, 0).sub(out.mul(out.x)).norm();
+	return { at: problem.map(spot.point), out, top, side: out.cross(top), scale: template.scale.mul(size / 2), size, kind: spot.kind, shape: template.shape };
 }
 
 // unreal's RotateAngleAxis: Vector turned Degrees about Axis

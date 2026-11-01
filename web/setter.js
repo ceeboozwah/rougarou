@@ -87,7 +87,7 @@ export class Setter {
 	choose() {
 		const player = this.agent.player;
 		const busy = (i) => player && (player.mode === 'climb' || player.mode === 'mount') && player.route === i;
-		const options = this.routes.map((r, i) => i).filter(i => !busy(i));
+		const options = this.routes.map((r, i) => i).filter(i => !busy(i) && !this.routes[i].endless);
 		// the one set longest ago (or never) goes first
 		options.sort((a, b) => (this.memory.data.setAt?.[this.routes[a].name] ?? 0) - (this.memory.data.setAt?.[this.routes[b].name] ?? 0));
 		return options[0] ?? -1;
