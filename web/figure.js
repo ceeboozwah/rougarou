@@ -65,6 +65,17 @@ export class Figure {
 		this.gaps = [new V(), new V(), new V(), new V()];
 		// how far the whole body may shift (m) to keep the hands and feet on their holds when a joint limit would pull a limb off one
 		this.follow = 0.4;
+		this.psiNow = {};
+		this.prevLocal = {};
+		this.ease = false;
+		this.maxTurn = 1;
+		this.shiftNow = new V();
+		this.shiftTarget = new V();
+		this.stretchNow = 1;
+		this.tick = 0;
+		this.advance = true;
+		this.smooth = false;
+		this.dt = 0;
 		// how far each joint has turned, over everything this character has done, by direction (see watch)
 		this.seen = {};
 		this.meshes = [];
@@ -219,7 +230,14 @@ export class Figure {
 		parent.updateWorldMatrix(true, false);
 		const pq = new Q();
 		parent.matrixWorld.decompose(new V(), pq, new V());
-		const local = this.limit(this.names.get(bone), inv(pq).multiply(world));
+		const name = this.names.get(bone);
+		let local = this.limit(name, inv(pq).multiply(world));
+		// in the last pass of a game frame no joint may turn faster than a person can: a snap (a twist wrapping round, a limit changing sides) glides instead
+		if (this.ease) {
+			const prev = this.prevLocal[name];
+			if (prev) { const turn = prev.angleTo(local); if (turn > this.maxTurn) local = prev.clone().slerp(local, this.maxTurn / turn); }
+			(this.prevLocal[name] ??= new Q()).copy(local);
+		}
 		bone.quaternion.copy(local);
 		if (position) bone.position.copy(parent.worldToLocal(position.clone()));
 		bone.updateMatrix();
@@ -316,15 +334,27 @@ export class Figure {
 			}
 			return c;
 		};
+		// the swivel: kept from the last frame and only nudged (a local descent from where it was), so the knee or elbow does not jump between two good answers.
+		// a search all the way round happens when the old one has gone bad, and its answer is taken only if it is clearly better. the move is rate limited
 		let psi = 0;
 		if (limU || limL || this.walls?.length) {
-			let best = cost(0);
-			const steps = 36;
-			for (let k = 0; k < steps; k++) {
-				const p = (k / steps) * 2 * Math.PI - Math.PI, c = cost(p);
-				if (c < best - 1e-9) { best = c; psi = p; }
+			const before = this.psiNow[upperName];
+			if (!this.advance && before !== undefined) psi = before;
+			else {
+				let p = before ?? 0, best = cost(p);
+				for (const h of [0.3, 0.12, 0.05, 0.02]) for (const q of [p - h, p + h]) { const c = cost(q); if (c < best - 1e-9) { best = c; p = q; } }
+				if (before === undefined || best > 0.8 || (this.tick++ & 31) === 0) {
+					let g = p, gc = best;
+					for (let k = 0; k < 36; k++) { const q = (k / 36) * 2 * Math.PI - Math.PI, c = cost(q); if (c < gc - 1e-9) { gc = c; g = q; } }
+					if (before === undefined || gc < best - 0.4) { p = g; best = gc; }
+					for (let h = Math.PI / 36; h > 0.01; h *= 0.5) for (const q of [p - h, p + h]) { const c = cost(q); if (c < best - 1e-9) { best = c; p = q; } }
+				}
+				if (this.smooth && before !== undefined) {
+					const gap = Math.atan2(Math.sin(p - before), Math.cos(p - before)), most = 6 * this.dt;
+					psi = before + clamp(gap, -most, most);
+				} else psi = p;
+				this.psiNow[upperName] = psi;
 			}
-			for (let h = Math.PI / steps; h > 0.004; h *= 0.5) for (const p of [psi - h, psi + h]) { const c = cost(p); if (c < best - 1e-9) { best = c; psi = p; } }
 		}
 		const chosen = attempt(psi);
 		const middle = chosen.middle;
@@ -374,18 +404,38 @@ export class Figure {
 	// weight, they do not leave a hand behind), a few passes, never further than this.follow
 	applyPose(pose, delta = 0) {
 		const base = this.limits;
+		// in the game (Delta > 0) everything the solver chooses is eased from frame to frame; the lab (Delta 0) takes each pose exactly
+		const smooth = delta > 0 && delta < 0.25, dt = Math.min(delta, 0.05);
+		this.smooth = smooth;
+		this.dt = dt;
+		if (!smooth) { this.psiNow = {}; this.prevLocal = {}; this.shiftNow.set(0, 0, 0); this.stretchNow = 1; }
+		this.maxTurn = Math.max(0.1, 0.25 * dt * 60);
 		this.stretch = 1;
-		this.#pass(pose, delta, new V());
-		if (!this.follow || !Object.keys(base).length) return;
-		let worst = this.#settle(pose);
+		this.advance = true;
+		this.#pass(pose, delta, this.shiftNow);
+		this.advance = false;
+		if (!this.follow || !Object.keys(base).length) { this.shiftNow.multiplyScalar(0.8); this.prevLocal = {}; return; }
+		let worst = this.#settle(pose, this.shiftNow.clone());
+		let need = 1, target = this.shiftTarget.clone();
 		// a pose the sim asks for that no body could hold (a foot above the hip within a hand's width of it): the joints are stretched past their ranges in steps,
 		// only as far as it takes, rather than leave a foot hanging a meter off its hold. this.stretch says how far it went (1 is within anatomy)
 		for (const k of [1.3, 1.7, 2.5, 4]) {
 			if (worst <= 0.05) break;
 			this.limits = this.stretched(k, base);
-			this.stretch = k;
-			worst = this.#settle(pose);
+			need = k;
+			worst = this.#settle(pose, target.clone());
+			target = this.shiftTarget.clone();
 		}
+		this.limits = base;
+		if (smooth) {
+			this.shiftNow.lerp(target, 1 - Math.exp(-dt * 12));
+			this.stretchNow += (need - this.stretchNow) * (1 - Math.exp(-dt * (need > this.stretchNow ? 14 : 3)));
+		} else { this.shiftNow.copy(target); this.stretchNow = need; }
+		this.stretch = this.stretchNow;
+		if (this.stretchNow > 1.01) this.limits = this.stretched(this.stretchNow, base);
+		this.ease = smooth;
+		this.#pass(pose, 0, this.shiftNow);
+		this.ease = false;
 		this.limits = base;
 	}
 
@@ -397,8 +447,7 @@ export class Figure {
 	}
 
 	// the body shifted toward whatever a limit holds short of its hold, a few passes. returns the worst miss left (m)
-	#settle(pose) {
-		const offset = new V();
+	#settle(pose, offset) {
 		this.#pass(pose, 0, offset);
 		for (let pass = 0; pass < 4 && Math.max(...this.misses) > 0.01; pass++) {
 			const step = new V();
@@ -407,6 +456,7 @@ export class Figure {
 			if (offset.length() > this.follow) offset.setLength(this.follow);
 			this.#pass(pose, 0, offset);
 		}
+		this.shiftTarget = offset;
 		return Math.max(...this.misses);
 	}
 
