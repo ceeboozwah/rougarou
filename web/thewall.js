@@ -5,6 +5,7 @@
 import * as THREE from 'three';
 import { Vec3 } from './sim.js';
 import { Sink, routeHolds, toThree, Door, Room } from './gym.js';
+import { holdMaterial } from './holdtex.js';
 import { Wall, makeChunk, band, bandY, Colors, CHUNK, PANEL, SPAN } from './wallgen.js';
 
 const V = (x, y, z) => new Vec3(x, y, z);
@@ -14,12 +15,13 @@ const Key = 'rougarou-wall';
 
 
 // one triangle soup as a mesh
-function soup(sink, color, roughness) {
+function soup(sink, color, roughness, resin = false) {
 	const geometry = new THREE.BufferGeometry();
 	geometry.setAttribute('position', new THREE.Float32BufferAttribute(sink.positions, 3));
 	geometry.setAttribute('normal', new THREE.Float32BufferAttribute(sink.normals, 3));
-	const material = new THREE.MeshStandardMaterial({ roughness, metalness: 0 });
-	material.color.setRGB(...color);
+	let material;
+	if (resin) material = holdMaterial(color, roughness);
+	else { material = new THREE.MeshStandardMaterial({ roughness, metalness: 0 }); material.color.setRGB(...color); }
 	const mesh = new THREE.Mesh(geometry, material);
 	mesh.castShadow = mesh.receiveShadow = true;
 	return mesh;
@@ -109,7 +111,7 @@ export class TheWall {
 				view.holds = all.filter(h => (h.line ?? -1) === line);
 				if (!view.holds.length) continue;
 				const built = routeHolds(view, k, fine);
-				group.add(soup(built.body, Colors[line], 0.5));
+				group.add(soup(built.body, Colors[line], 0.5, true));
 				dark.positions.push(...built.dark.positions);
 				dark.normals.push(...built.dark.normals);
 			}

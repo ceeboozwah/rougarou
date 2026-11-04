@@ -10,6 +10,7 @@ import { TheWall, DoorWay } from './thewall.js';
 import { PoseEditor } from './poseeditor.js';
 import { FormLab } from './formlab.js';
 import { collectWall } from './wallpose.js';
+import { loadHoldTextures, holdMaterial } from './holdtex.js';
 import { Prints, ChalkUp } from './chalking.js';
 import { Brain, Memory } from './brain.js';
 import { Climber, walkPose, blend, handOn, solve, awayFromWall } from './climber.js';
@@ -77,13 +78,15 @@ const fill = new THREE.PointLight(0xffffff, 1.4, 22, 1);
 fill.position.copy(three(new Vec3(420, -150, 260)));
 scene.add(fill);
 
+loadHoldTextures();
 const gym = buildGym(routes);
-const soup = (sink, color, roughness = 0.82) => {
+const soup = (sink, color, roughness = 0.82, resin = false) => {
 	const geometry = new THREE.BufferGeometry();
 	geometry.setAttribute('position', new THREE.Float32BufferAttribute(sink.positions, 3));
 	geometry.setAttribute('normal', new THREE.Float32BufferAttribute(sink.normals, 3));
-	const material = new THREE.MeshStandardMaterial({ roughness, metalness: 0 });
-	material.color.setRGB(...color);
+	let material;
+	if (resin) material = holdMaterial(color, roughness);
+	else { material = new THREE.MeshStandardMaterial({ roughness, metalness: 0 }); material.color.setRGB(...color); }
 	const mesh = new THREE.Mesh(geometry, material);
 	mesh.receiveShadow = true;
 	scene.add(mesh);
@@ -92,7 +95,7 @@ const soup = (sink, color, roughness = 0.82) => {
 // pale birch plywood and charcoal panels, holds in satin resin
 soup(gym.boards[0], [0.84, 0.68, 0.47]);
 soup(gym.boards[1], [0.055, 0.055, 0.06], 0.9);
-gym.paint.forEach((sink, i) => { soup(sink, gym.palette[i], 0.5).castShadow = true; });
+gym.paint.forEach((sink, i) => { soup(sink, gym.palette[i], 0.5, true).castShadow = true; });
 // the bolt holes, one instanced batch
 {
 	const hole = new THREE.CylinderGeometry(0.0075, 0.0075, 0.002, 7);
@@ -116,16 +119,16 @@ function rebuild(index) {
 	const group = sets[index];
 	for (const mesh of [...group.children]) { mesh.geometry.dispose(); mesh.material.dispose(); group.remove(mesh); }
 	const built = routeHolds(routes[index], index);
-	const mesh = (sink, color, roughness) => {
+	const mesh = (sink, color, roughness, resin = false) => {
 		const geometry = new THREE.BufferGeometry();
 		geometry.setAttribute('position', new THREE.Float32BufferAttribute(sink.positions, 3));
 		geometry.setAttribute('normal', new THREE.Float32BufferAttribute(sink.normals, 3));
-		const m = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ roughness, metalness: 0 }));
-		m.material.color.setRGB(...color);
+		const m = new THREE.Mesh(geometry, resin ? holdMaterial(color, roughness) : new THREE.MeshStandardMaterial({ roughness, metalness: 0 }));
+		if (!resin) m.material.color.setRGB(...color);
 		m.castShadow = m.receiveShadow = true;
 		group.add(m);
 	};
-	mesh(built.body, built.color, 0.5);
+	mesh(built.body, built.color, 0.5, true);
 	mesh(built.dark, [0.01, 0.01, 0.01], 0.8);
 	if (spots) {
 		spots[index] = world.startSpot(routes[index]);
