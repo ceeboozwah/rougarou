@@ -135,7 +135,15 @@ export const Focus = V(1300, 100, 170);
 
 // triangles with flat normals, wound so three.js draws the side Facing points to
 export class Sink {
-	constructor() { this.positions = []; this.normals = []; }
+	constructor() { this.positions = []; this.normals = []; this.hole = null; this.tag = null; }
+	// a hold with a bolt hole sets Tag = [center x, y, z (three's meters), cut radius (m), axis x, y, z] while its body is added: every vertex of it carries that,
+	// and the hold's shader leaves the circle of the hole open (holdtex.js). the vertices of everything else carry zeros
+	#tagged(count) {
+		if (!this.tag && !this.hole) return;
+		const had = this.positions.length / 3 - count;
+		if (!this.hole) this.hole = new Array(had * 7).fill(0);
+		for (let i = 0; i < count; i++) this.hole.push(...(this.tag ?? [0, 0, 0, 0, 0, 0, 0]));
+	}
 	add(a, b, c, facing) {
 		// unreal's lit normal of a winding is (c - a) x (b - a); mirrored into three.js the same winding faces the mirrored normal
 		let n = c.sub(a).cross(b.sub(a)).norm();
@@ -143,6 +151,7 @@ export class Sink {
 		for (const p of [a, b, c]) this.positions.push(...toThree(p));
 		const m = toThree(n.mul(100));
 		for (let i = 0; i < 3; i++) this.normals.push(...m);
+		this.#tagged(3);
 	}
 	// a triangle shaded smoothly from its corners' normals, for the rounded resin of a hold
 	smooth(a, b, c, na, nb, nc, facing) {
@@ -150,6 +159,7 @@ export class Sink {
 		if (n.dot(facing) < 0) { [b, c] = [c, b]; [nb, nc] = [nc, nb]; }
 		for (const p of [a, b, c]) this.positions.push(...toThree(p));
 		for (const m of [na, nb, nc]) this.normals.push(...toThree(m.mul(100)));
+		this.#tagged(3);
 	}
 }
 
@@ -219,8 +229,115 @@ function holdFrame(spot, normal, up) {
 	};
 }
 
+// a countersunk bolt hole in the top of a hold, with a socket head screw in it. real holds are bolted through a ~12 mm hole whose rim is chamfered and
+// rounded where it meets the resin, and the screw (M10, hex socket) sits a few millimetres down in it. the body of the hold is left open in a circle by its
+// shader (the sink's tag), and this builds what is seen through it: the rounded funnel, the wall of the hole and its floor (into Body, the hold's own resin), the
+// steel head with its chamfered edge and hex socket (into Steel), and the dark bottom of the socket (into Dark). all of it is laid on the plane of the face the
+// axis meets, so it follows a tilted or lumpy top. returns the tag for the body, or null where a hold is too thin or hollow to take one
+function boltSite(where, points, kept, scale, hold) {
+	if (hold.shape === 'pocket' || Math.min(scale.x, scale.y) < 4) return null;
+	const out = where.vector(V(0, 0, 1)).norm();
+	const base = where.point(V(0, 0, 0));
+	let best = null;
+	for (const [a, b, c] of kept) {
+		const A = points[a], e1 = points[b].sub(A), e2 = points[c].sub(A);
+		const n = e1.cross(e2), len = n.len();
+		if (len < 1e-6) continue;
+		const d = n.dot(out);
+		if (Math.abs(d) < 0.3 * len) continue;
+		const s = n.dot(A.sub(base)) / d;
+		const w = base.add(out.mul(s)).sub(A);
+		const d00 = e1.dot(e1), d01 = e1.dot(e2), d11 = e2.dot(e2), d20 = w.dot(e1), d21 = w.dot(e2);
+		const den = d00 * d11 - d01 * d01;
+		if (Math.abs(den) < 1e-9) continue;
+		const bv = (d11 * d20 - d01 * d21) / den, bw = (d00 * d21 - d01 * d20) / den;
+		if (bv < 0 || bw < 0 || bv + bw > 1) continue;
+		if (!best || s > best.s) best = { s, n: n.mul(d > 0 ? 1 / len : -1 / len) };
+	}
+	if (!best) return null;
+	// the size follows the hold: the full 12 mm hole on a normal hold, smaller on a small one
+	const k = Math.min(1.15, Math.min(scale.x, scale.y) * 0.3);
+	return { out, u: where.vector(V(1, 0, 0)).norm(), v: where.vector(V(0, 1, 0)).norm(), at: base.add(out.mul(best.s)), n: best.n, k, cut: 1.0 * k - 0.04 * k };
+}
+
+function boltHoleTag(site) {
+	const c = toThree(site.at), a = toThree(site.out.mul(100));
+	const l = Math.hypot(...a);
+	return [...c, site.cut / 100, a[0] / l, a[1] / l, a[2] / l];
+}
+
+function buildBolt(site, body, dark, steel, fine) {
+	const { out, u, v, at, n, k } = site;
+	const seg = fine ? 20 : 12;
+	const lean = n.dot(out);
+	// a point of the hole: radius R and angle, Depth below the plane of the face (all in centimeters, scaled by the hole's size)
+	const pt = (r, theta, depth) => {
+		const lateral = u.mul(r * k * Math.cos(theta)).add(v.mul(r * k * Math.sin(theta)));
+		const lift = -n.dot(lateral) / lean;
+		return at.add(lateral).add(out.mul(lift - depth * k));
+	};
+	const radial = (theta) => u.mul(Math.cos(theta)).add(v.mul(Math.sin(theta)));
+	// a surface of revolution from a profile of [radius, depth] points, shaded smoothly. Inward: the visible side faces the axis (a hole), else away (a head)
+	const lathe = (sink, profile, inward) => {
+		const norm = profile.map((p, j) => {
+			const a = profile[Math.max(0, j - 1)], b = profile[Math.min(profile.length - 1, j + 1)];
+			const dr = b[0] - a[0], dd = b[1] - a[1];
+			// the profile's tangent in (radius, up) is (dr, -dd); a hole's visible normal is (tz, -tr), a head's is (-tz, tr)
+			const s = inward ? 1 : -1;
+			const nr = s * -dd, nz = s * -dr, l = Math.hypot(nr, nz) || 1;
+			return [nr / l, nz / l];
+		});
+		for (let j = 0; j + 1 < profile.length; j++) for (let s = 0; s < seg; s++) {
+			const t0 = 2 * Math.PI * s / seg, t1 = 2 * Math.PI * (s + 1) / seg;
+			const P = (jj, t) => pt(profile[jj][0], t, profile[jj][1]);
+			const N = (jj, t) => radial(t).mul(norm[jj][0]).add(out.mul(norm[jj][1])).norm();
+			const a = P(j, t0), b = P(j, t1), c = P(j + 1, t1), d = P(j + 1, t0);
+			const na = N(j, t0), nb = N(j, t1), nc = N(j + 1, t1), nd = N(j + 1, t0);
+			const facing = na.add(nb).add(nc).add(nd);
+			sink.smooth(a, b, c, na, nb, nc, facing);
+			sink.smooth(a, c, d, na, nc, nd, facing);
+		}
+	};
+	const Rout = 1.0, Rin = 0.62, Db = 0.3, D0 = 0.04, Dw = 0.68;
+	// the hole: a rounded rim running flush with the surface into a straight wall, then the floor
+	const hole = [];
+	const steps = fine ? 6 : 3;
+	for (let i = 0; i <= steps; i++) {
+		const t = i / steps;
+		hole.push([Rin + (Rout - Rin) * (1 - Math.sin(t * Math.PI / 2)), D0 + Db * (1 - Math.cos(t * Math.PI / 2))]);
+	}
+	hole.push([Rin, Dw]);
+	lathe(body, hole, true);
+	for (let s = 0; s < seg; s++) body.add(pt(0, 0, Dw), pt(Rin, 2 * Math.PI * s / seg, Dw), pt(Rin, 2 * Math.PI * (s + 1) / seg, Dw), out);
+	// the screw: a socket head sitting a little below the rim, a rounded top edge and a hex socket
+	const Dt = 0.34, Rh = 0.5, Rt = 0.38;
+	const head = [];
+	for (let i = 0; i <= 3; i++) {
+		const t = i / 3;
+		head.push([Rt + (Rh - Rt) * Math.sin(t * Math.PI / 2), Dt + 0.1 * (1 - Math.cos(t * Math.PI / 2))]);
+	}
+	head.push([Rh, Dt + 0.32]);
+	lathe(steel, head, false);
+	// the flat top, a ring from the head's edge in to the hex corners, then the socket's six walls and its dark floor
+	const hexR = 0.23, hexDepth = 0.2, hex = [];
+	for (let i = 0; i < 6; i++) hex.push(i * Math.PI / 3);
+	const ring = 12;
+	for (let i = 0; i < 6; i++) {
+		const c0 = pt(Rt, 2 * Math.PI * (2 * i) / ring, Dt), c1 = pt(Rt, 2 * Math.PI * (2 * i + 1) / ring, Dt), c2 = pt(Rt, 2 * Math.PI * (2 * i + 2) / ring, Dt);
+		const h0 = pt(hexR, hex[i], Dt), h1 = pt(hexR, hex[(i + 1) % 6], Dt);
+		steel.add(h0, c0, c1, out);
+		steel.add(h0, c1, h1, out);
+		steel.add(h1, c1, c2, out);
+		const l0 = pt(hexR, hex[i], Dt + hexDepth), l1 = pt(hexR, hex[(i + 1) % 6], Dt + hexDepth);
+		const inward = out.mul(-0.001).sub(radial((hex[i] + hex[(i + 1) % 6]) / 2));
+		steel.add(h0, h1, l1, inward);
+		steel.add(h0, l1, l0, inward);
+		dark.add(pt(0, 0, Dt + hexDepth), l0, l1, out);
+	}
+}
+
 // bake one hold into the sinks. Size is the nominal size in centimeters
-function buildHold(index, size, where, seed, body, dark, fine = false) {
+function buildHold(index, size, where, seed, body, dark, fine = false, steel = null) {
 	const Ico = Icos[fine ? 1 : 0];
 	const hold = Templates[index];
 	const scale = hold.scale.mul(size / 2);
@@ -274,13 +391,17 @@ function buildHold(index, size, where, seed, body, dark, fine = false) {
 		if (n.dot(points[a].add(points[b]).add(points[c]).mul(1 / 3).sub(center)) < 0) n = n.mul(-1);
 		for (const i of [a, b, c]) normals[i] = normals[i].add(n);
 	}
+	const site = steel ? boltSite(where, points, kept, scale, hold) : null;
+	body.tag = site ? boltHoleTag(site) : null;
 	for (const [a, b, c] of kept) {
 		const mid = points[a].add(points[b]).add(points[c]).mul(1 / 3);
 		body.smooth(points[a], points[b], points[c], normals[a].norm(), normals[b].norm(), normals[c].norm(), mid.sub(center));
 	}
-	// the bolt: a dark washer sunk in the top of the hold
+	body.tag = null;
+	if (site) buildBolt(site, body, dark, steel, fine);
+	// no room for a real bolt hole (a pocket, a thin edge): a dark washer sunk in the top of the hold
 	const top = place(V(0, 0, scale.z * (1 + hold.noise * 0.5) + 0.2));
-	for (let s = 0; s < 8; s++) {
+	for (let s = 0; s < (site ? 0 : 8); s++) {
 		const a0 = 2 * Math.PI * s / 8, a1 = 2 * Math.PI * (s + 1) / 8;
 		dark.add(top, place(V(Math.cos(a0) * 1.3, Math.sin(a0) * 1.3, scale.z * (1 + hold.noise * 0.5) + 0.2)), place(V(Math.cos(a1) * 1.3, Math.sin(a1) * 1.3, scale.z * (1 + hold.noise * 0.5) + 0.2)), out);
 	}
@@ -302,6 +423,7 @@ export function buildGym(routes) {
 	const palette = [];
 	const paint = [];
 	const shadow = new Sink();
+	const screws = new Sink();
 	const blocks = [];
 	const lights = [];
 	const swatch = (color) => {
@@ -350,7 +472,7 @@ export function buildGym(routes) {
 			const color = swatch(decor[dice.int(0, decor.length - 1)]);
 			const at = a.add(b.sub(a).mul(s)).add(c.sub(a).mul(t));
 			placed.push({ at, size });
-			buildHold(index, size, holdFrame(at, normal, up), dice.int(0, 1 << 20), paint[color], shadow);
+			buildHold(index, size, holdFrame(at, normal, up), dice.int(0, 1 << 20), paint[color], shadow, false, screws);
 		}
 		if (dice.frand() < 0.035 * crowd) {
 			const black = dice.frand() < 0.6;
@@ -404,22 +526,22 @@ export function buildGym(routes) {
 	for (let y = -1450; y < 1500; y += 100) block(V(-29, y, 14), V(58, 97, 28), [0.03, 0.03, 0.035]);
 	block(V(1150, 0, -5), V(2950, 3400, 10), [0.25, 0.25, 0.25], false);
 	const siding = [0.6, 0.6, 0.58];
-	block(V(-300, 0, 450), V(20, 3500, 900), siding, false);
-	block(V(1150, -1650, 450), V(2900, 20, 900), siding, false);
-	block(V(1150, 1650, 450), V(2900, 20, 900), siding, false);
+	block(V(-300, 0, 450), V(20, 3500, 900), siding);
+	block(V(1150, -1650, 450), V(2900, 20, 900), siding);
+	block(V(1150, 1650, 450), V(2900, 20, 900), siding);
 	// the front wall, with a doorway in it for The Wall: a piece each side and one over the top
 	{
 		const gap = Door.width / 2;
-		block(V(2560, (-1650 - gap) / 2, 450), V(20, 1650 - gap, 900), siding, false);
-		block(V(2560, (1650 + gap) / 2, 450), V(20, 1650 - gap, 900), siding, false);
-		block(V(2560, 0, (Door.height + 900) / 2), V(20, Door.width, 900 - Door.height), siding, false);
+		block(V(2560, (-1650 - gap) / 2, 450), V(20, 1650 - gap, 900), siding);
+		block(V(2560, (1650 + gap) / 2, 450), V(20, 1650 - gap, 900), siding);
+		block(V(2560, 0, (Door.height + 900) / 2), V(20, Door.width, 900 - Door.height), siding);
 	}
 	// the room: black mats, a slab under them, tall steel-sided walls (a kilometre of them: the wall inside has no top)
 	for (let x = 2670; x < 4400; x += 200)
 		for (let y = -850; y < 900; y += 100) block(V(x, y, 14), V(196, 97, 28), [0.03, 0.03, 0.035]);
 	block(V((2570 + 4400) / 2, 0, -5), V(1830, 1800, 10), [0.25, 0.25, 0.25], false);
-	block(V((2570 + 4400) / 2, -910, 50000), V(1830, 20, 100000), siding, false);
-	block(V((2570 + 4400) / 2, 910, 50000), V(1830, 20, 100000), siding, false);
+	block(V((2570 + 4400) / 2, -910, 50000), V(1830, 20, 100000), siding);
+	block(V((2570 + 4400) / 2, 910, 50000), V(1830, 20, 100000), siding);
 	block(V(4450, 0, 50000), V(40, 1840, 100000), [0.05, 0.05, 0.055], false);
 	block(V(1150, 0, 915), V(2950, 3400, 20), [0.72, 0.66, 0.55], false);
 	for (let x = -200; x <= 2400; x += 520) block(V(x, 0, 870), V(30, 3300, 60), steel, false);
@@ -509,22 +631,22 @@ export function buildGym(routes) {
 	for (let x = 1000; x <= 1700; x += 100) block(V(x, -1538, 230), V(6, 6, 460), [0.8, 0.8, 0.8], false);
 	lights.push({ at: V(1350, -1350, 260), color: [0.8, 0.9, 1], intensity: 4, range: 12 });
 
-	return { boards, palette, paint, shadow, blocks, lights, holes, decorHolds: placed };
+	return { boards, palette, paint, shadow, steel: screws, blocks, lights, holes, decorHolds: placed };
 }
 
 // one problem's holds in its tape color, turned so each lip faces away from the way it is pulled. built apart from the gym
 // so the route editor can rebuild a problem after moving its holds. a hold's Seed keeps its shape when holds are added or removed
 export function routeHolds(problem, index, fine = true) {
-	const body = new Sink(), dark = new Sink();
+	const body = new Sink(), dark = new Sink(), steel = new Sink();
 	problem.holds.forEach((spot, h) => {
 		// a hold the setter has taken off the wall and is carrying is not on it
 		if (spot.carried) return;
 		const face = problem.at(spot.point.y);
 		const up = face.right.mul(-spot.pull.x).add(face.up.mul(-spot.pull.y));
 		const seed = spot.seed ?? h;
-		buildHold(pickTemplate(spot.kind, index * 31 + seed), holdSize(spot.kind), holdFrame(problem.map(spot.point), face.out, up), index * 977 + seed, body, dark, fine);
+		buildHold(pickTemplate(spot.kind, index * 31 + seed), holdSize(spot.kind), holdFrame(problem.map(spot.point), face.out, up), index * 977 + seed, body, dark, fine, steel);
 	});
-	return { body, dark, color: tape(index) };
+	return { body, dark, steel, color: tape(index) };
 }
 
 // where a problem's hold is and which way it faces, for things that go on it (chalk prints): the same template, size and frame routeHolds builds it with.

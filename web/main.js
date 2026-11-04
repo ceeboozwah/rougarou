@@ -10,7 +10,8 @@ import { TheWall, DoorWay } from './thewall.js';
 import { PoseEditor } from './poseeditor.js';
 import { FormLab } from './formlab.js';
 import { collectWall } from './wallpose.js';
-import { loadHoldTextures, holdMaterial } from './holdtex.js';
+import { loadHoldTextures, holdMaterial, screwMaterial, holeAttributes } from './holdtex.js';
+import { gymEnvironment } from './envmap.js';
 import { Prints, ChalkUp } from './chalking.js';
 import { Brain, Memory } from './brain.js';
 import { Climber, walkPose, blend, handOn, solve, awayFromWall } from './climber.js';
@@ -64,9 +65,12 @@ const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 80);
 const editor = new Editor(scene, routes, originals, { cursor: (x, y) => cursor(x, y), screenOf: (p) => screenOf(p), rebuild: (i) => rebuild(i), toast: (t, k) => ui.toast(t, k) });
 sim.restart();
 
-scene.add(new THREE.HemisphereLight(0xfff3e2, 0x2a241e, 1.05));
+// reflections: the gym's own lights, windows and walls, filtered, so the satin resin holds and the skin catch them
+scene.environment = gymEnvironment(renderer);
+scene.environmentIntensity = 0.55;
+scene.add(new THREE.HemisphereLight(0xfff3e2, 0x2a241e, 0.55));
 // one key light from over the camera's shoulder so hold shadows fall short and soft onto the wall; it follows the climber
-const key = new THREE.DirectionalLight(0xffffff, 2.1);
+const key = new THREE.DirectionalLight(0xffffff, 2.3);
 key.castShadow = true;
 key.shadow.mapSize.set(touchy ? 1024 : 2048, touchy ? 1024 : 2048);
 Object.assign(key.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 40 });
@@ -74,6 +78,15 @@ key.shadow.bias = -0.0004;
 key.shadow.normalBias = 0.02;
 scene.add(key, key.target);
 const keyDirection = new THREE.Vector3(0.27, -0.616, -0.74).normalize();
+// the gym's ceiling lights, as one more shadow caster from almost straight above: every hold throws a short shadow down the wall under it
+const ceiling = new THREE.DirectionalLight(0xfff6ea, 1.5);
+ceiling.castShadow = true;
+ceiling.shadow.mapSize.set(touchy ? 1024 : 2048, touchy ? 1024 : 2048);
+Object.assign(ceiling.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 40 });
+ceiling.shadow.bias = -0.0004;
+ceiling.shadow.normalBias = 0.02;
+scene.add(ceiling, ceiling.target);
+const ceilingDirection = new THREE.Vector3(-0.12, -0.95, -0.28).normalize();
 const fill = new THREE.PointLight(0xffffff, 1.4, 22, 1);
 fill.position.copy(three(new Vec3(420, -150, 260)));
 scene.add(fill);
@@ -85,7 +98,7 @@ const soup = (sink, color, roughness = 0.82, resin = false) => {
 	geometry.setAttribute('position', new THREE.Float32BufferAttribute(sink.positions, 3));
 	geometry.setAttribute('normal', new THREE.Float32BufferAttribute(sink.normals, 3));
 	let material;
-	if (resin) material = holdMaterial(color, roughness);
+	if (resin) { material = holdMaterial(color, roughness); holeAttributes(geometry, sink); }
 	else { material = new THREE.MeshStandardMaterial({ roughness, metalness: 0 }); material.color.setRGB(...color); }
 	const mesh = new THREE.Mesh(geometry, material);
 	mesh.receiveShadow = true;
@@ -93,8 +106,8 @@ const soup = (sink, color, roughness = 0.82, resin = false) => {
 	return mesh;
 };
 // pale birch plywood and charcoal panels, holds in satin resin
-soup(gym.boards[0], [0.84, 0.68, 0.47]);
-soup(gym.boards[1], [0.055, 0.055, 0.06], 0.9);
+// the panels are one-sided sheets: they cast shadows from both faces, or the lights would shine straight through them onto the floor behind
+for (const mesh of [soup(gym.boards[0], [0.84, 0.68, 0.47]), soup(gym.boards[1], [0.055, 0.055, 0.06], 0.9)]) { mesh.castShadow = true; mesh.material.shadowSide = THREE.DoubleSide; }
 gym.paint.forEach((sink, i) => { soup(sink, gym.palette[i], 0.5, true).castShadow = true; });
 // the bolt holes, one instanced batch
 {
@@ -108,6 +121,15 @@ gym.paint.forEach((sink, i) => { soup(sink, gym.palette[i], 0.5, true).castShado
 	scene.add(mesh);
 }
 soup(gym.shadow, [0.01, 0.01, 0.01]);
+// the screws in the gym's decorative holds: steel, one mesh
+{
+	const geometry = new THREE.BufferGeometry();
+	geometry.setAttribute('position', new THREE.Float32BufferAttribute(gym.steel.positions, 3));
+	geometry.setAttribute('normal', new THREE.Float32BufferAttribute(gym.steel.normals, 3));
+	const screws = new THREE.Mesh(geometry, screwMaterial());
+	screws.castShadow = screws.receiveShadow = true;
+	scene.add(screws);
+}
 // each problem's holds are their own meshes, rebuilt when the route setter moves one
 const sets = routes.map(() => {
 	const group = new THREE.Group();
@@ -119,17 +141,19 @@ function rebuild(index) {
 	const group = sets[index];
 	for (const mesh of [...group.children]) { mesh.geometry.dispose(); mesh.material.dispose(); group.remove(mesh); }
 	const built = routeHolds(routes[index], index);
-	const mesh = (sink, color, roughness, resin = false) => {
+	const mesh = (sink, color, roughness, resin = false, metal = false) => {
 		const geometry = new THREE.BufferGeometry();
 		geometry.setAttribute('position', new THREE.Float32BufferAttribute(sink.positions, 3));
 		geometry.setAttribute('normal', new THREE.Float32BufferAttribute(sink.normals, 3));
-		const m = new THREE.Mesh(geometry, resin ? holdMaterial(color, roughness) : new THREE.MeshStandardMaterial({ roughness, metalness: 0 }));
-		if (!resin) m.material.color.setRGB(...color);
+		if (resin) holeAttributes(geometry, sink);
+		const m = new THREE.Mesh(geometry, metal ? screwMaterial() : resin ? holdMaterial(color, roughness) : new THREE.MeshStandardMaterial({ roughness, metalness: 0 }));
+		if (!resin && !metal) m.material.color.setRGB(...color);
 		m.castShadow = m.receiveShadow = true;
 		group.add(m);
 	};
 	mesh(built.body, built.color, 0.5, true);
 	mesh(built.dark, [0.01, 0.01, 0.01], 0.8);
+	if (built.steel.positions.length) mesh(built.steel, [1, 1, 1], 0.4, false, true);
 	if (spots) {
 		spots[index] = world.startSpot(routes[index]);
 		tags[index].position.copy(three(spots[index].at.add(Z.mul(255))));
@@ -334,7 +358,7 @@ function applySettings(s) {
 	const fast = s.quality === 'low' || (s.quality === 'auto' && touchy);
 	renderer.setPixelRatio(Math.min(devicePixelRatio, fast ? 1.5 : 2));
 	const size = fast ? 1024 : 2048;
-	if (key.shadow.mapSize.x !== size) { key.shadow.mapSize.set(size, size); key.shadow.map?.dispose(); key.shadow.map = null; }
+	for (const light of [key, ceiling]) if (light.shadow.mapSize.x !== size) { light.shadow.mapSize.set(size, size); light.shadow.map?.dispose(); light.shadow.map = null; }
 	resize();
 }
 
@@ -1234,6 +1258,8 @@ function update(real) {
 	const center = three(pelvis);
 	key.target.position.copy(center);
 	key.position.copy(center).addScaledVector(keyDirection, -15);
+	ceiling.target.position.copy(center);
+	ceiling.position.copy(center).addScaledVector(ceilingDirection, -15);
 
 	// the tags and the start rings belong to the gym floor, not the climb
 	const roaming = mode === 'walk' || mode === 'rise' || mode === 'hop' || mode === 'fall';

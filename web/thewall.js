@@ -5,7 +5,7 @@
 import * as THREE from 'three';
 import { Vec3 } from './sim.js';
 import { Sink, routeHolds, toThree, Door, Room } from './gym.js';
-import { holdMaterial } from './holdtex.js';
+import { holdMaterial, screwMaterial, holeAttributes } from './holdtex.js';
 import { Wall, makeChunk, band, bandY, Colors, CHUNK, PANEL, SPAN } from './wallgen.js';
 
 const V = (x, y, z) => new Vec3(x, y, z);
@@ -15,15 +15,17 @@ const Key = 'rougarou-wall';
 
 
 // one triangle soup as a mesh
-function soup(sink, color, roughness, resin = false) {
+function soup(sink, color, roughness, resin = false, metal = false) {
 	const geometry = new THREE.BufferGeometry();
 	geometry.setAttribute('position', new THREE.Float32BufferAttribute(sink.positions, 3));
 	geometry.setAttribute('normal', new THREE.Float32BufferAttribute(sink.normals, 3));
 	let material;
-	if (resin) material = holdMaterial(color, roughness);
+	if (metal) material = screwMaterial();
+	else if (resin) { material = holdMaterial(color, roughness); holeAttributes(geometry, sink); }
 	else { material = new THREE.MeshStandardMaterial({ roughness, metalness: 0 }); material.color.setRGB(...color); }
 	const mesh = new THREE.Mesh(geometry, material);
 	mesh.castShadow = mesh.receiveShadow = true;
+	mesh.material.shadowSide = THREE.DoubleSide;
 	return mesh;
 }
 
@@ -105,7 +107,7 @@ export class TheWall {
 		if (own) {
 			// one mesh per line: each line's holds are their own color
 			const all = route.holds.slice(own.from, own.to);
-			const dark = new Sink();
+			const dark = new Sink(), screws = new Sink();
 			for (const line of [-1, 0, 1, 2, 3, 4]) {
 				const view = Object.create(route);
 				view.holds = all.filter(h => (h.line ?? -1) === line);
@@ -114,8 +116,11 @@ export class TheWall {
 				group.add(soup(built.body, Colors[line], 0.5, true));
 				dark.positions.push(...built.dark.positions);
 				dark.normals.push(...built.dark.normals);
+				screws.positions.push(...built.steel.positions);
+				screws.normals.push(...built.steel.normals);
 			}
 			group.add(soup(dark, [0.01, 0.01, 0.01], 0.8));
+			if (screws.positions.length) group.add(soup(screws, [1, 1, 1], 0.4, false, true));
 		}
 		group.traverse(o => { if (o.isMesh) { o.frustumCulled = true; } });
 		group.fine = fine;
