@@ -11,6 +11,7 @@ import { PoseEditor } from './poseeditor.js';
 import { FormLab } from './formlab.js';
 import { collectWall } from './wallpose.js';
 import { BodyCheck } from './bodycheck.js';
+import { bakeWall } from './wallbake.js';
 import { loadHoldTextures, holdMaterial, screwMaterial, holeAttributes } from './holdtex.js';
 import { gymEnvironment } from './envmap.js';
 import { Prints, ChalkUp } from './chalking.js';
@@ -189,7 +190,7 @@ for (const l of gym.lights) {
 
 const climber = new Climber(scene);
 // the form lab (F6): an AI that trains on realistic joint bending and learns limits
-const formLab = new FormLab({ scene, prepare: async (y) => { while (theWall.ready < Math.floor(y / 10) + 3) { await theWall.ensure(y); await new Promise(r => setTimeout(r, 50)); } }, toast: (t, k) => ui.toast(t, k), collect: (chunks, progress) => collectWall(theWall, { chunks, progress }), onApply: (set, mix) => { for (const model of [climber.model, agent?.climber?.model]) { model?.setLimits(set); model?.setMix(mix); } } });
+const formLab = new FormLab({ scene, prepare: async (y) => { while (theWall.ready < Math.floor(y / 10) + 3) { await theWall.ensure(y); await new Promise(r => setTimeout(r, 50)); } }, toast: (t, k) => ui.toast(t, k), collect: async (chunks, progress) => { bodyCheck.wall = true; try { return await collectWall(theWall, { chunks, progress, gate: bodyCheck.gate }); } finally { bodyCheck.wall = false; } }, onApply: (set, mix) => { for (const model of [climber.model, agent?.climber?.model]) { model?.setLimits(set); model?.setMix(mix); } } });
 
 // the pose restriction editor (F3): joint limits for the characters, kept in limits.json and enforced on every skeleton
 const poseEd = new PoseEditor({ renderer, canvas, toast: (t, k) => ui.toast(t, k), onSaved: (set) => { climber.model?.setLimits(set); agent?.climber?.model?.setLimits(set); }, seen: () => climber.model?.seen });
@@ -259,6 +260,7 @@ const watching = { on: false };
 }
 // the skeleton judges every move (bodycheck.js): the player's sim, Tuck's and every copy made for a rehearsal refuse a hold the joints cannot reach or that would put a knee or elbow into the wall
 const bodyCheck = new BodyCheck();
+theWall.bakedReady.then(() => { bodyCheck.bakedTop = theWall.baked ? theWall.baked.holds.length * 10 - 6 : 0; });
 bodyCheck.load().then(() => { sim.gate = bodyCheck.gate; agent.sim.gate = bodyCheck.gate; }).catch(() => { /* without the skeleton the sim's own rules stand */ });
 // rings that pulse on the start holds of the problem in front of you
 const rings = [0, 1].map(() => {
@@ -1358,6 +1360,6 @@ else { walker.near = -1; pose = walkerPose(); }
 $('loading').remove();
 requestAnimationFrame(frame);
 // a handle for poking at the game from the console
-window.rougarou = { theWall, bodyCheck, formLab, prints, poseEd, agent, watching, camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
+window.rougarou = { bake: (chunks, progress) => bakeWall(bodyCheck, { chunks, progress }), theWall, bodyCheck, formLab, prints, poseEd, agent, watching, camera, climber, fp, sendLimb, sim, routes, get spots() { return spots; }, walker, world, ui, editor, recorder, audio, screenOf, place, lift, pullOn, jumpDown, visit, retry, goTo, editRoute, finishEdit, get mode() { return mode; }, get pose() { return pose; }, view: () => ({ camYaw, camPitch }), aim: (yaw, pitch) => { camYaw = yaw; camPitch = pitch; },
 	// run the game forward without waiting on the browser's frame clock
 	tick: (seconds) => { for (let t = 0; t < seconds; t += 1 / 60) update(1 / 60); } };

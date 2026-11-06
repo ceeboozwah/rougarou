@@ -82,6 +82,32 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         os.replace(path + '.tmp', path)
         return self.reply(200, {'ok': True, 'joints': len(limits)})
 
+    def save_wall(self):
+        # the endless wall drawn under the skeleton's gate (web/wallbake.js): its panel angles and every chunk's holds, so the game does not have to draw them again
+        if not self.local():
+            return self.reply(403, {'error': 'local only'})
+        try:
+            data = self.body()
+            lean, holds = data['lean'], data['holds']
+            assert isinstance(lean, list) and len(lean) < 5000 and all(isinstance(v, (int, float)) for v in lean)
+            assert isinstance(holds, list) and len(holds) < 1000
+            for chunk in holds:
+                assert isinstance(chunk, list) and len(chunk) < 600
+                for h in chunk:
+                    assert isinstance(h['kind'], str) and len(h['kind']) < 12
+                    assert all(isinstance(v, (int, float)) for v in (h['x'], h['y'], h['px'], h['py'], h['line']))
+        except Exception:
+            return self.reply(400, {'error': 'that is not a baked wall'})
+        path = os.path.join(ROOT, 'wall-baked.json')
+        os.makedirs(os.path.join(CACHE, 'wall-backups'), exist_ok=True)
+        if os.path.exists(path):
+            import shutil, time
+            shutil.copy(path, os.path.join(CACHE, 'wall-backups', f'wall-{int(time.time())}.json'))
+        with open(path + '.tmp', 'w') as f:
+            json.dump({'version': 1, 'gate': True, 'chunks': len(holds), 'lean': lean, 'holds': holds}, f, separators=(',', ':'))
+        os.replace(path + '.tmp', path)
+        return self.reply(200, {'ok': True, 'chunks': len(holds)})
+
     def do_GET(self):
         if self.path == '/ai/status':
             if not self.local(): return self.reply(403, {'error': 'local only'})
@@ -97,6 +123,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/dev/limits':
             return self.save_limits()
+        if self.path == '/dev/wall':
+            return self.save_wall()
         if not self.path.startswith('/ai/') or not self.local():
             return self.reply(403, {'error': 'not allowed'})
         try:

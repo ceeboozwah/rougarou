@@ -18,7 +18,7 @@ export function revive(o) {
 }
 
 // climb the first Chunks chunks (10 m each) of the wall and return the poses, with the height each was taken at. Progress(done, total) is told how far it is
-export async function collectWall(wall, { chunks = 4, progress } = {}) {
+export async function collectWall(wall, { chunks = 4, progress, gate } = {}) {
 	while (wall.ready < chunks + 1) { await wall.ensure((wall.ready + 1) * SPAN); await new Promise(r => setTimeout(r, 0)); }
 	const climber = new Climber(new THREE.Scene());
 	const poses = [];
@@ -26,6 +26,7 @@ export async function collectWall(wall, { chunks = 4, progress } = {}) {
 	const result = await solve(wall.route, {
 		maxMoves: 60 * chunks,
 		finish: (sim) => sim.position.y > top,
+		gate,
 		observe: (sim) => {
 			climber.climbPose(sim, -1, 1);
 			const pose = climber.climbPose(sim, -1, 1);

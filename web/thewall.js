@@ -3,7 +3,7 @@
 // chunks at a time around the climber, the rest dropped) and grows it ahead of whoever is climbing, and holds the door and its sign.
 
 import * as THREE from 'three';
-import { Vec3 } from './sim.js';
+import { Vec2, Vec3 } from './sim.js';
 import { Sink, routeHolds, toThree, Door, Room } from './gym.js';
 import { holdMaterial, screwMaterial, holeAttributes } from './holdtex.js';
 import { Wall, makeChunk, band, bandY, Colors, CHUNK, PANEL, SPAN } from './wallgen.js';
@@ -48,6 +48,15 @@ export class TheWall {
 		this.height = 0;
 		this.tick = 0;
 		fetch('./wall-hints.json').then(r => r.ok ? r.json() : null).then(d => { if (d?.attempts) this.hints = d.attempts; }).catch(() => {});
+		// the first chunks drawn once under the skeleton's gate (wallbake.js): the panel angles and holds are taken as they are, no solving; past them it draws as before
+		this.baked = null;
+		this.bakedReady = fetch('./wall-baked.json').then(r => r.ok ? r.json() : null).then(d => {
+			if (!d?.holds?.length || !d.lean?.length) return;
+			this.baked = d;
+			this.route.lean = d.lean.slice();
+			this.route.panels.length = 0;
+			this.route.grow(CHUNK * 3);
+		}).catch(() => {});
 	}
 
 	load() { try { return Number(JSON.parse(localStorage.getItem(Key) || '{}').best) || 0; } catch { return 0; } }
@@ -64,13 +73,15 @@ export class TheWall {
 
 	// keep the wall built three chunks above Y (meters up the wall) and the meshes only where the climber is
 	async ensure(y) {
+		await this.bakedReady;
 		const goal = Math.floor(y / SPAN) + 3;
 		if (this.busy || this.ready >= goal) return;
 		this.busy = true;
 		try {
 			while (this.ready < goal) {
 				const k = this.ready + 1;
-				const made = await makeChunk(k, this.route, this.hints[k]);
+				const bakedChunk = this.baked?.holds[k];
+				const made = bakedChunk ? { holds: bakedChunk.map(h => ({ point: new Vec2(h.x, h.y), kind: h.kind, pull: new Vec2(h.px, h.py), line: h.line })) } : await makeChunk(k, this.route, this.hints[k]);
 				// chunk 0's band is already on the wall: only what is new is added
 				const fresh = k === 0 ? made.holds.slice(this.route.holds.length) : made.holds;
 				const from = this.route.holds.length;

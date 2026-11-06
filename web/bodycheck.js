@@ -7,7 +7,7 @@
 import * as THREE from 'three';
 import { Figure } from './figure.js';
 import { Climber } from './climber.js';
-import { humanDefaults } from './limits.js';
+import { humanDefaults, loadLimits } from './limits.js';
 
 const Names = ['right foot', 'left foot', 'right hand', 'left hand'];
 
@@ -20,14 +20,23 @@ export class BodyCheck {
 		this.miss = 0.04;
 		this.clip = 0.02;
 		this.on = true;
+		// set while the wall is being drawn (the dev job that bakes it): the gate then judges the endless wall's moves too
+		this.wall = false;
+		// how high up the endless wall (meters) the baked chunks reach; 0 until the file is loaded
+		this.bakedTop = 0;
 		// a bound function so it can be handed to a Sim as its gate
 		this.gate = (sim, limb, hold) => this.judge(sim, limb, hold);
 	}
 
 	async load(url = './assets/character/climber.glb') {
 		this.figure = await Figure.load(url, { limits: false });
-		this.figure.limits = humanDefaults();
+		// the same ranges the game's characters wear: limits.json, with the textbook ones for any joint the file leaves out
+		this.figure.limits = { ...humanDefaults(), ...(await loadLimits()) };
 		this.figure.openSearch = true;
+		// a judgment, not a picture: a shorter hip search. the body is judged as it will be drawn, out of the wall (so a part that would have been in the wall is
+		// pushed out, and the move is refused only if that leaves the limb off its hold)
+		this.figure.searchSteps = [0.3, 0.3, 0.12];
+		this.figure.noClip = true;
 	}
 
 	// null when the move can be made, or why not
@@ -35,7 +44,8 @@ export class BodyCheck {
 		if (!this.figure || !this.on) return null;
 		// the endless wall was drawn and checked without a skeleton: a quarter of the foot moves its solver relies on need more hip than a person has, so on it the
 		// joints still obey their ranges but the move is not refused (the gym's nine problems all still send with the gate on)
-		if (sim.routes[sim.route].endless) return null;
+		// the endless wall's first chunks were drawn under this gate (wallbake.js), so on them it judges like anywhere else; past them, and while no baked wall is loaded, not
+		if (sim.routes[sim.route].endless && !this.wall && !(sim.position.y < this.bakedTop)) return null;
 		const key = `${sim.route}|${sim.grips.join(',')}|${sim.smeared.map(Number).join('')}|${limb}:${hold}|${Math.round(sim.position.x * 25)},${Math.round(sim.position.y * 25)}`;
 		if (this.cache.has(key)) { this.stats.cached++; return this.cache.get(key); }
 		const t0 = performance.now();
@@ -44,7 +54,7 @@ export class BodyCheck {
 		c.gate = null;
 		let why = null;
 		if (c.grab(limb, hold)) {
-			for (let f = 0; f < 100 && !c.fallen; f++) c.step(1 / 60);
+			for (let f = 0; f < 70 && !c.fallen; f++) c.step(1 / 60);
 			if (!c.fallen) {
 				this.climber.climbPose(c, -1, 1);
 				const pose = this.climber.climbPose(c, -1, 1);

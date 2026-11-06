@@ -64,6 +64,7 @@ export class FormLab {
 		f.openSearch = opts.open ?? true;
 		f.limits = limits ?? {};
 		f.hits = {};
+		f.overruled = 0;
 		f.setMix(mix);
 		f.applyPose(pose, 0);
 		f.root.updateMatrixWorld(true);
@@ -86,18 +87,21 @@ export class FormLab {
 		const c = f.clipNow();
 		let twistOver = 0;
 		for (const n of this.names) { const lim = this.anatomy[n]; const t = turns[n].twist; twistOver = Math.max(twistOver, t > 0 ? t - lim.twist[1] : lim.twist[0] - t); }
-		return { miss: [...f.misses], turns, strain, hits: { ...f.hits }, stretch: f.stretch, clip: c.worst > 0.01, clipDepth: c.worst, twistOver, open: f.openNow.toArray() };
+		return { miss: [...f.misses], turns, strain, hits: { ...f.hits }, stretch: f.stretch, clip: c.worst > 0.01, clipDepth: c.worst, twistOver, open: f.openNow.toArray(), push: f.pushNow.length(), overruled: f.overruled };
 	}
 
 	// every pose under one setting: how many limbs land on their holds, how far they miss, how strained the body is, which joints ran into a wall
 	study(limits, mix, poses = this.poses, opts = {}) {
 		const misses = [], strains = [], held = {};
-		let every = 0, knee = 0, elbow = 0, stretched = 0, clips = 0, deepest = 0, twistOver = 0, opened = 0;
+		let every = 0, knee = 0, elbow = 0, stretched = 0, clips = 0, deepest = 0, twistOver = 0, opened = 0, pushed = 0, pushSum = 0, overruled = 0;
 		for (const { pose } of poses) {
 			const r = this.replay(pose, limits, mix, opts);
 			deepest = Math.max(deepest, r.clipDepth);
 			twistOver = Math.max(twistOver, r.twistOver);
 			if (Math.hypot(...r.open) > 0.1) opened++;
+			if (r.push > 0.01) pushed++;
+			if (r.overruled) overruled++;
+			pushSum += r.push;
 			misses.push(...r.miss);
 			strains.push(r.strain);
 			if (r.miss.every(m => m < HIT)) every++;
@@ -115,7 +119,7 @@ export class FormLab {
 			worst: Math.max(0, ...misses) * 100,
 			strain: strains.reduce((a, b) => a + b, 0) / n,
 			held: Object.fromEntries(Object.entries(held).map(([k, v]) => [k, v / n])),
-			knee, elbow, stretched: stretched / n, clip: clips / n, deepest: deepest * 100, twistOver, opened: opened / n,
+			knee, elbow, stretched: stretched / n, clip: clips / n, deepest: deepest * 100, twistOver, opened: opened / n, pushed: pushed / n, push: pushSum / n * 100, overruled: overruled / n,
 		};
 	}
 
@@ -179,6 +183,66 @@ export class FormLab {
 		const free = this.study(null, DEFAULT), fixed = this.study(this.anatomy, DEFAULT, this.poses, { open: false }), opened = this.study(this.anatomy, DEFAULT), trained = this.study(this.anatomy, this.mix);
 		this.report = [['no limits', free], ['strict limits, hips fixed', fixed], ['strict limits, hips open', opened], ['+ trained weights and spine', trained]].map(([name, s]) => ({ name, ...s }));
 		this.persist();
+	}
+
+	// which of the limits in the file stop the wall's moves: each field of each joint type (both sides) is put back to its textbook range on its own and every wall pose
+	// is replayed; the gain in poses with all four limbs on their holds (and half the gain in limbs on) says what it costs. only widenings are tried
+	*rankJob() {
+		const book = humanDefaults(), mix = this.mix ?? DEFAULT, rows = [];
+		const score = (s) => s.every * 100 + s.reach * 50;
+		this.progress = 'ranking the limits: the file as it is';
+		yield;
+		const base = score(this.study(this.anatomy, mix, this.poses, { open: true }));
+		const types = ['Upperarm', 'Thigh', 'Forearm', 'Calf', 'Hand', 'Foot', 'Waist', 'Spine01', 'Spine02', 'NeckTwist01', 'NeckTwist02', 'Head', 'Clavicle'];
+		for (const type of types) for (const field of ['fwd', 'back', 'out', 'inn', 'twist']) {
+			const names = this.names.filter(n => n === type || n.endsWith(`_${type}`));
+			const trial = JSON.parse(JSON.stringify(this.anatomy));
+			let from = null, to = null;
+			for (const n of names) {
+				if (!this.file[n]) continue;
+				const u = trial[n], b = book[n];
+				if (field === 'twist') {
+					const t = [Math.min(u.twist[0], b.twist[0]), Math.max(u.twist[1], b.twist[1])];
+					if (t[0] !== u.twist[0] || t[1] !== u.twist[1]) { from ??= [...u.twist]; to ??= t; u.twist = t; }
+				} else if (b[field] > u[field]) { from ??= u[field]; to ??= b[field]; u[field] = b[field]; }
+			}
+			if (from == null) continue;
+			const gain = score(this.study(trial, mix, this.poses, { open: true })) - base;
+			rows.push({ type, field, from, to, gain });
+			this.progress = `ranking the limits: ${type} ${field}`;
+			yield;
+		}
+		this.ranking = rows.sort((a, b) => b.gain - a.gain);
+		// the suggestion: every widening that frees at least a point's worth of moves, and nothing past the textbook range
+		const proposed = JSON.parse(JSON.stringify(this.anatomy));
+		for (const r of this.ranking) {
+			if (r.gain < 1) continue;
+			for (const n of this.names.filter(n => n === r.type || n.endsWith(`_${r.type}`))) {
+				if (!this.file[n]) continue;
+				if (r.field === 'twist') proposed[n].twist = [Math.min(proposed[n].twist[0], book[n].twist[0]), Math.max(proposed[n].twist[1], book[n].twist[1])];
+				else proposed[n][r.field] = Math.max(proposed[n][r.field], book[n][r.field]);
+			}
+		}
+		this.proposed = Object.fromEntries(Object.entries(proposed).filter(([n]) => this.file[n]));
+		const after = this.study({ ...this.anatomy, ...this.proposed }, mix, this.poses, { open: true }), before = this.study(this.anatomy, mix, this.poses, { open: true });
+		this.rankOutcome = { before, after };
+		this.progress = 'ranked';
+	}
+
+	async applyProposed() {
+		if (!this.proposed) return;
+		const set = { ...JSON.parse(JSON.stringify(this.file)), ...JSON.parse(JSON.stringify(this.proposed)) }, mix = this.mix ?? undefined;
+		this.onApply?.(set, mix ?? {});
+		this.file = set;
+		this.anatomy = { ...humanDefaults(), ...JSON.parse(JSON.stringify(set)) };
+		try {
+			const r = await fetch('/dev/limits', { method: 'POST', body: JSON.stringify({ version: 1, limits: set, ...(mix ? { mix } : {}) }) });
+			if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `error ${r.status}`);
+			const back = await loadLimits();
+			this.toast?.(JSON.stringify(back) === JSON.stringify(set) ? 'suggested limits saved to limits.json (your old file is kept in tools/.cache/limit-backups)' : 'saved, but the file read back differently', JSON.stringify(back) === JSON.stringify(set) ? 'good' : 'warn');
+		} catch (e) { this.toast?.(`on the characters for now; not written to limits.json (${e.message})`, 'warn'); }
+		this.proposed = null;
+		this.draw();
 	}
 
 	async go() {
@@ -319,6 +383,8 @@ export class FormLab {
 		this.gatherBtn = el('button', { className: 'main', textContent: 'climb the wall and take poses', onclick: () => this.gather() });
 		this.trainBtn = el('button', { className: 'main', textContent: 'train and test', onclick: () => this.go() });
 		this.applyBtn = el('button', { textContent: 'apply trained weights + spine', onclick: () => this.ask() });
+		this.rankBtn = el('button', { textContent: 'rank my limits', onclick: () => { if (this.poses.length && !this.busy) this.run(this.rankJob()); } });
+		this.proposeBtn = el('button', { textContent: 'apply suggested limits', onclick: () => this.applyProposed() });
 		this.status = el('p');
 		this.front = el('canvas', { width: 380, height: 300 });
 		this.slider = el('input', { type: 'range', min: 0, max: 0, value: 0, oninput: () => { this.shown = Number(this.slider.value); this.draw(); } });
@@ -329,6 +395,7 @@ export class FormLab {
 			el('p', { className: 'intro', textContent: 'trains on realistic bending, flexion and rotation, on the wall itself. the AI climbs the endless wall, every joint obeys anatomical ranges from the biomechanics literature, and it learns how the spine and neck should share a turn so the hands and feet stay on their holds and the body stays relaxed.' }),
 			el('div', { className: 'row' }, this.chunkSel, this.gatherBtn),
 			el('div', { className: 'row' }, this.genSel, this.trainBtn),
+			el('div', { className: 'row' }, this.rankBtn, this.proposeBtn),
 			el('div', { className: 'row' }, this.applyBtn, this.watchBtn = el('button', { textContent: 'watch in the game', onclick: () => this.watch(!this.watching) }), el('button', { textContent: 'pause / go', onclick: () => { this.pause = !this.pause; } }), el('button', { textContent: 'close', onclick: () => this.close() })),
 			this.status, this.front, this.slider,
 			el('small', { textContent: 'a pose off the wall, front and side: white is the body under the anatomical ranges, grey the same pose with no limits at all. drag to step through the poses.' }),
@@ -364,6 +431,8 @@ export class FormLab {
 		this.status.textContent = this.progress ?? (this.poses.length ? '' : 'press "climb the wall and take poses"');
 		this.gatherBtn.disabled = this.busy; this.trainBtn.disabled = this.busy || !this.poses.length;
 		this.applyBtn.disabled = !this.mix;
+		this.rankBtn.disabled = this.busy || !this.poses.length;
+		this.proposeBtn.disabled = !this.proposed;
 		const g = this.front.getContext('2d');
 		g.clearRect(0, 0, 380, 300);
 		const entry = this.poses[this.shown];
@@ -397,11 +466,17 @@ export class FormLab {
 		}
 		this.out.replaceChildren();
 		if (this.report) {
-			const t = el('table'); t.append(el('tr', {}, ...['on the wall poses', 'on hold', 'every limb', 'miss cm', 'worst cm', 'body in wall', 'deepest cm', 'hips opened', 'strain', 'knee°', 'elbow°'].map(h => el('th', { textContent: h }))));
+			const t = el('table'); t.append(el('tr', {}, ...['on the wall poses', 'on hold', 'every limb', 'miss cm', 'worst cm', 'body in wall', 'deepest cm', 'pushed out', 'limit overruled', 'hips opened', 'strain', 'knee°', 'elbow°'].map(h => el('th', { textContent: h }))));
 			const bestStrain = Math.min(...this.report.slice(1).map(r => r.strain));
-			for (const r of this.report) t.append(el('tr', {}, el('td', { textContent: r.name }), el('td', { textContent: `${round(r.reach * 100)}%` }), el('td', { textContent: `${round(r.every * 100)}%` }), el('td', { textContent: r.miss.toFixed(2) }), el('td', { textContent: r.worst.toFixed(1) }), el('td', { className: r.clip > 0.1 ? 'bad' : 'good', textContent: `${round(r.clip * 100)}%` }), el('td', { textContent: r.deepest.toFixed(1) }), el('td', { textContent: `${round(r.opened * 100)}%` }), el('td', { className: r.strain === bestStrain ? 'good' : '', textContent: r.strain.toFixed(2) }), el('td', { textContent: round(r.knee) }), el('td', { textContent: round(r.elbow) })));
+			for (const r of this.report) t.append(el('tr', {}, el('td', { textContent: r.name }), el('td', { textContent: `${round(r.reach * 100)}%` }), el('td', { textContent: `${round(r.every * 100)}%` }), el('td', { textContent: r.miss.toFixed(2) }), el('td', { textContent: r.worst.toFixed(1) }), el('td', { className: r.clip > 0.1 ? 'bad' : 'good', textContent: `${round(r.clip * 100)}%` }), el('td', { textContent: (r.deepest ?? 0).toFixed(1) }), el('td', { textContent: `${round((r.pushed ?? 0) * 100)}% (${(r.push ?? 0).toFixed(1)} cm)` }), el('td', { className: (r.overruled ?? 0) > 0 ? 'bad' : 'good', textContent: `${round((r.overruled ?? 0) * 100)}%` }), el('td', { textContent: `${round(r.opened * 100)}%` }), el('td', { className: r.strain === bestStrain ? 'good' : '', textContent: r.strain.toFixed(2) }), el('td', { textContent: round(r.knee) }), el('td', { textContent: round(r.elbow) })));
 			this.out.append(el('h2', { textContent: 'how it performed' }), t, el('small', { textContent: 'on hold: limbs that land within 1.5 cm of where the climber aimed. body in wall: poses where any part of the body (thighs, shins, arms, trunk, head) is more than a centimeter into the wall or a hold, and the deepest it goes. hips opened: poses where the pelvis was turned to get a limb out of the wall or onto its hold. every limb: poses where all four do. knee and elbow: the most they folded, in degrees (a person folds a knee 135-155 and an elbow 145-150).' }));
 			if (this.mix) this.out.append(el('p', { textContent: `trained split: the waist takes ${round(this.mix.waist * 100)}% and the mid spine ${round(this.mix.spine01 * 100)}% of the turn from pelvis to chest; the lower neck ${round(this.mix.neck1 * 100)}% and the mid neck ${round(this.mix.neck2 * 100)}% of the turn from chest to face (it was 35, 70, 35, 65); the solver's cost for turning the pelvis is ${((this.mix.wopen ?? 0.25) * 12).toFixed(1)} and for strained joints ${((this.mix.wstrain ?? 0.2) * 2).toFixed(2)}.` }));
+		}
+		if (this.ranking) {
+			const t = el('table'); t.append(el('tr', {}, ...['joint', 'range', 'yours', 'textbook', 'moves freed'].map(h => el('th', { textContent: h }))));
+			for (const r of this.ranking.slice(0, 14)) t.append(el('tr', {}, el('td', { textContent: r.type }), el('td', { textContent: r.field }), el('td', { textContent: Array.isArray(r.from) ? `${r.from[0]}..${r.from[1]}` : r.from }), el('td', { textContent: Array.isArray(r.to) ? `${r.to[0]}..${r.to[1]}` : r.to }), el('td', { className: r.gain >= 1 ? 'good' : '', textContent: r.gain.toFixed(1) })));
+			this.out.append(el('h2', { textContent: 'which of your limits cost the most' }), el('small', { textContent: 'each range put back to the textbook value on its own, both sides; moves freed = the change in (poses with all four limbs on x 100 + limbs on x 50) over the wall poses.' }), t);
+			if (this.rankOutcome) { const a = this.rankOutcome.after, b = this.rankOutcome.before; this.out.append(el('p', { textContent: `with every widening that frees a point or more: limbs on hold ${round(b.reach * 100)}% to ${round(a.reach * 100)}%, all four ${round(b.every * 100)}% to ${round(a.every * 100)}%, body in wall ${round(a.clip * 100)}%.` })); }
 		}
 		if (this.needs) {
 			const t = el('table'); t.append(el('tr', {}, ...['joint', 'front', 'back', 'out', 'in', 'twist'].map(h => el('th', { textContent: h }))));

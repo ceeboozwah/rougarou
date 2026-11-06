@@ -66,6 +66,13 @@ export class Figure {
 		// how far the whole body may shift (m) to keep the hands and feet on their holds when a joint limit would pull a limb off one
 		this.follow = 0.4;
 		this.psiNow = {};
+		// nothing of the body may be in the wall or a hold (applyPose pushes the whole body out until it is not, up to maxPush meters)
+		this.noClip = true;
+		this.searchSteps = null;
+		this.overruled = 0;
+		this.maxPush = 0.5;
+		this.pushNow = new V();
+		this.limbPush = [new V(), new V(), new V(), new V()];
 		this.endAt = [new V(), new V(), new V(), new V()];
 		this.balls = [];
 		this.openNow = new V();
@@ -265,17 +272,25 @@ export class Figure {
 		return name ? pq.multiply(inv(this.rest[name].q)) : pq;
 	}
 
-	// how far a point is in front of the wall panels under it, in meters (a big number where there is no wall)
-	wallDepth(p) {
-		let depth = 9;
+	// the wall panel nearest in front of a point: its depth in meters (9 where there is no wall) and the way it faces
+	wallAt(p) {
+		// the wall is a run of flat panels, each a strip: a point's depth is its distance in front of the panel it is nearest, measured to the strip itself and not to
+		// the plane it lies in (a plane carried on past the edge of its panel cuts through open air at a convex corner, and at those a knee was found "in the wall")
+		let depth = 9, n = null, best = Infinity;
 		for (const w of this.walls ?? []) {
 			const d = p.clone().sub(w.o), along = d.dot(w.u) + w.start;
-			if (along < w.start - 0.15 || along > w.start + w.length + 0.15) continue;
-			const here = d.dot(w.n);
-			if (here > -0.6) depth = Math.min(depth, here);
+			const s = clamp(along, w.start, w.start + w.length);
+			const q = d.clone().addScaledVector(w.u, -(s - w.start));
+			const here = q.dot(w.n);
+			if (here < -0.6) continue;
+			const dist = s === along ? Math.abs(here) : q.length();
+			if (dist < best) { best = dist; depth = s === along ? here : dist; n = w.n; }
 		}
-		return depth;
+		return { depth, n };
 	}
+
+	// how far a point is in front of the wall panels under it, in meters (a big number where there is no wall)
+	wallDepth(p) { return this.wallAt(p).depth; }
 
 	// one arm or leg: two-bone IK from the bone's own shoulder or hip to Target, then the end bone to World. Flex is the way the joint bends at rest (forward
 	// for an elbow, back for a knee). the elbow or knee can sit anywhere on a circle around the line from the root to the target (the swivel): Pole says where it
@@ -434,7 +449,7 @@ export class Figure {
 		const smooth = delta > 0 && delta < 0.25, dt = Math.min(delta, 0.05);
 		this.smooth = smooth;
 		this.dt = dt;
-		if (!smooth) { this.psiNow = {}; this.prevLocal = {}; this.shiftNow.set(0, 0, 0); this.openNow.set(0, 0, 0); this.stretchNow = 1; }
+		if (!smooth) { this.psiNow = {}; this.prevLocal = {}; this.shiftNow.set(0, 0, 0); this.openNow.set(0, 0, 0); this.pushNow.set(0, 0, 0); this.limbPush.forEach(v => v.set(0, 0, 0)); this.stretchNow = 1; }
 		this.maxTurn = Math.max(0.1, 0.25 * dt * 60);
 		this.stretch = 1;
 		this.advance = true;
@@ -447,7 +462,7 @@ export class Figure {
 		if (this.openSearch) {
 			let cur = this.openNow.clone(), best = this.#score(pose, this.shiftNow, cur);
 			// in the game it walks a little each frame from where it was; the lab has one go at a pose, so it looks further
-			const steps = smooth ? [0.2, 0.08] : [0.3, 0.3, 0.15, 0.15, 0.07, 0.03];
+			const steps = this.searchSteps ?? (smooth ? [0.2, 0.08] : [0.3, 0.3, 0.15, 0.15, 0.07, 0.03]);
 			for (const step of steps) for (const axis of ['x', 'y', 'z']) for (const sign of [1, -1]) {
 				const c = cur.clone();
 				c[axis] = clamp(c[axis] + sign * step, -this.openMax[axis], this.openMax[axis]);
@@ -481,9 +496,46 @@ export class Figure {
 		} else { this.shiftNow.copy(target); this.stretchNow = need; }
 		this.stretch = this.stretchNow;
 		if (this.stretchNow > 1.01) this.limits = this.stretched(this.stretchNow, base);
-		this.ease = smooth;
-		this.#pass(pose, 0, this.shiftNow, this.openNow);
-		this.ease = false;
+		// the last pass, and then the rule that comes before everything else: no part of the body is in the wall or a hold. whatever is, the whole body is moved
+		// out along the way that part is being pushed (the wall's normal, the hold's gradient) by the depth plus a millimeter, and posed again, until nothing is
+		// (at most this.maxPush). a limb that is then too far from its hold is simply short of it: clipping goes before holds, and the ranges stay as they are.
+		// the push lets go slowly in the game, so the body does not twitch in and out
+		const snap = Object.fromEntries(Object.entries(this.prevLocal).map(([k, q]) => [k, q.clone()]));
+		let easing = smooth;
+		const pass = (extra) => {
+			this.prevLocal = Object.fromEntries(Object.entries(snap).map(([k, q]) => [k, q.clone()]));
+			this.ease = easing;
+			this.#pass(pose, 0, this.shiftNow.clone().add(extra), this.openNow);
+			this.ease = false;
+		};
+		const push = this.pushNow.clone().multiplyScalar(smooth ? Math.exp(-dt * 5) : 0);
+		for (const v of this.limbPush) v.multiplyScalar(smooth ? Math.exp(-dt * 6) : 0);
+		pass(push);
+		if (this.noClip) {
+			for (let i = 0; i < 8; i++) {
+				const c = this.clipNow();
+				if (c.worst <= 0 || !c.dir) break;
+				// the limit on how fast a joint may turn (which only smooths the motion) gives way after the first few tries: nothing in the wall comes first
+				if (i >= 2) easing = false;
+				push.addScaledVector(c.dir, c.worst * (1 + i * 0.25) + 0.004);
+				if (push.length() > this.maxPush) push.setLength(this.maxPush);
+				pass(push);
+			}
+			this.#depenetrate();
+			// and if a limb is still caught (a foot target that no joint can reach without it): the whole body goes further out, as far as it takes, the hands and feet
+			// staying where the sim put them. nothing in the wall is not negotiable
+			for (let i = 0; i < 12; i++) {
+				const c = this.clipNow();
+				if (c.worst <= 0 || !c.dir) break;
+				push.addScaledVector(c.dir, c.worst * 1.5 + 0.01);
+				if (push.length() > 1.5) push.setLength(1.5);
+				pass(push);
+				this.#depenetrate();
+			}
+		}
+		// the next frame's turn-rate limit starts from where the joints really are now, whichever pass got them there
+		if (smooth) for (const name of Object.keys(this.prevLocal)) this.prevLocal[name] = this.bones[name].quaternion.clone();
+		this.pushNow.copy(push);
 		this.limits = base;
 	}
 
@@ -519,33 +571,93 @@ export class Figure {
 		return q >= 1 ? 9 : (Math.sqrt(q) - 1) * Math.min(h.h + radius, h.r + radius);
 	}
 
-	// how far the body is in the wall or in a hold: the legs, arms, trunk and head as capsules sampled along their length (their ends are held by a hold on
-	// purpose, so only the insides are tested, and a hold the limb is on or at is skipped). returns the sum of squared depths (m2) and the deepest (m)
+	// how far the body is in the wall or in a hold: the legs, arms, pelvis, trunk and head as capsules and balls sampled along their length (the hands and feet
+	// are where the sim put them, on a hold, and no push of the body can move them, so they are not tested; a hold a limb is on or at is skipped for it). returns the sum of squared depths (m2), the deepest (m) and the way out of it
 	clipNow() {
 		const P = (n) => { const e = this.bones[n].matrixWorld.elements; return new V(e[12], e[13], e[14]); };
-		let sum = 0, worst = 0;
+		let sum = 0, worst = 0, dir = null, limb = -1, bone = null, at = null;
 		this.clipBy = {};
-		let tag = '';
-		const test = (p, radius, skip) => {
-			let depth = this.wallDepth(p) - radius - 0.01;
-			if (depth < 0) { sum += depth * depth; worst = Math.max(worst, -depth); this.clipBy[tag + ':wall'] = Math.max(this.clipBy[tag + ':wall'] ?? 0, -depth); }
+		let tag = '', owner = -1, proximal = null, here = null;
+		const note = (kind, depth, d) => {
+			sum += depth * depth;
+			this.clipBy[`${tag}:${kind}`] = Math.max(this.clipBy[`${tag}:${kind}`] ?? 0, -depth);
+			if (-depth > worst) { worst = -depth; dir = d; limb = owner; bone = proximal; at = here; }
+		};
+		const test = (p, radius, skip, margin = 0.01) => {
+			here = p;
+			// within a hand's width of where a limb's own end is held (on a panel, or at a corner between two) is where it is meant to be touching
+			const w = this.wallAt(p);
+			let depth = w.depth - radius - margin;
+			if (depth < 0 && w.n && !(skip && skip.distanceTo(p) < 0.12)) note('wall', depth, w.n);
 			for (const h of this.balls) {
 				if (skip && skip.distanceTo(h.c) < h.r + 0.12) continue;
 				depth = this.domeClear(p, h, radius);
-				if (depth < 0) { sum += depth * depth; worst = Math.max(worst, -depth); this.clipBy[tag + ':hold'] = Math.max(this.clipBy[tag + ':hold'] ?? 0, -depth); }
+				if (depth < 0) {
+					// out along the dome's own gradient: sideways from its middle and up from the wall
+					const d = p.clone().sub(h.c), along = d.dot(h.n);
+					const lateral = d.clone().addScaledVector(h.n, -along);
+					const g = lateral.multiplyScalar(1 / (h.r + radius) ** 2).addScaledVector(h.n, Math.max(along, 0) / (h.h + radius) ** 2);
+					note('hold', depth, g.lengthSq() > 1e-12 ? g.normalize() : h.n.clone());
+				}
 			}
 		};
-		const along = (a, b, radius, skip) => { for (const t of [0.3, 0.5, 0.7]) test(a.clone().lerp(b, t), radius, skip); };
+		const along = (a, b, radius, skip) => { for (const t of [0.15, 0.3, 0.5, 0.7, 0.85]) test(a.clone().lerp(b, t), radius, skip); };
 		for (const [l, side] of [[0, 'R'], [1, 'L'], [2, 'R'], [3, 'L']]) {
 			const skip = this.endAt[l];
-			if (l < 2) { tag = `${side}thigh`; along(P(`${side}_Thigh`), P(`${side}_Calf`), 0.08, skip); tag = `${side}shin`; along(P(`${side}_Calf`), P(`${side}_Foot`), 0.05, skip); }
-			else { tag = `${side}arm`; along(P(`${side}_Upperarm`), P(`${side}_Forearm`), 0.045, skip); tag = `${side}forearm`; along(P(`${side}_Forearm`), P(`${side}_Hand`), 0.04, skip); }
+			owner = l;
+			if (l < 2) { tag = `${side}thigh`; proximal = `${side}_Thigh`; along(P(`${side}_Thigh`), P(`${side}_Calf`), 0.08, skip); tag = `${side}shin`; proximal = `${side}_Calf`; along(P(`${side}_Calf`), P(`${side}_Foot`), 0.05, skip); }
+			else { tag = `${side}arm`; proximal = `${side}_Upperarm`; along(P(`${side}_Upperarm`), P(`${side}_Forearm`), 0.045, skip); tag = `${side}forearm`; proximal = `${side}_Forearm`; along(P(`${side}_Forearm`), P(`${side}_Hand`), 0.04, skip); }
 		}
+		owner = -1;
+		proximal = null;
+		tag = 'pelvis';
+		test(P('Hip'), 0.12, null);
 		tag = 'torso';
 		along(P('Hip'), P('Head'), 0.13, null);
 		tag = 'head';
 		test(P('Head'), 0.1, null);
-		return { sum, worst };
+		return { sum, worst, dir, limb, bone, at };
+	}
+
+	// the last resort, and a certain one: whatever part of a limb is in the wall or a hold is turned out of it about its own joint (the shin about the knee, then the
+	// thigh about the hip; the forearm about the elbow, then the arm about the shoulder), each turn held to the joint's range unless the range itself is what holds the limb in the wall. the limb leaves its hold by exactly as
+	// much as it takes. returns whether anything was left in
+	#depenetrate() {
+		for (let i = 0; i < 90; i++) {
+			const c = this.clipNow();
+			if (c.worst <= 0) return false;
+			if (!c.bone || !c.dir) return true;
+			let moved = false;
+			const chain = c.bone.endsWith('_Calf') ? [c.bone, c.bone.replace('Calf', 'Thigh')] : c.bone.endsWith('_Forearm') ? [c.bone, c.bone.replace('Forearm', 'Upperarm')] : [c.bone];
+			// each joint of the limb in turn, first within its range; one that does not take the part out of the wall by a real step is put back and the next tried, and
+			// if none does the first goes past its range after all
+			for (const overrule of [false, true]) {
+				for (const name of chain) {
+					if (moved) break;
+					const bone = this.bones[name];
+					bone.updateWorldMatrix(true, false);
+					const joint = new V().setFromMatrixPosition(bone.matrixWorld);
+					const r = c.at.clone().sub(joint), len = r.length();
+					if (len < 0.03) continue;
+					let axis = new V().crossVectors(r, c.dir), straight = false;
+					// a limb pointing straight into the wall (or straight out of a hold) has no one way round: turn it about any axis across the way out
+					if (axis.lengthSq() < 1e-6) { axis = new V().crossVectors(c.dir, Math.abs(c.dir.y) < 0.9 ? new V(0, 1, 0) : new V(1, 0, 0)); straight = true; }
+					const angle = straight ? 0.3 : Math.min(0.25, (c.worst + 0.003) / len * 1.3);
+					const before = bone.quaternion.clone();
+					const worldQ = this.worldQ(bone), parentQ = this.worldQ(bone.parent);
+					const wanted = inv(parentQ).multiply(new Q().setFromAxisAngle(axis.normalize(), angle).multiply(worldQ));
+					bone.quaternion.copy(overrule ? wanted : this.limit(name, wanted));
+					bone.updateMatrix();
+					bone.updateMatrixWorld(true);
+					const after = this.clipNow();
+					if (after.worst < c.worst * 0.97 - 1e-5 || (after.worst <= c.worst && after.sum < c.sum * 0.9)) { moved = true; if (overrule) this.overruled++; }
+					else { bone.quaternion.copy(before); bone.updateMatrix(); bone.updateMatrixWorld(true); }
+				}
+				if (moved) break;
+			}
+			if (!moved) return true;
+		}
+		return this.clipNow().worst > 0;
 	}
 
 	// joints near the end of their range, from the bones as they stand: (the share of the range past 80%) squared, and the twist the same
@@ -622,6 +734,7 @@ export class Figure {
 
 		for (let l = 0; l < 4; l++) {
 			const limb = pose.limbs[l], arm = l >= 2, side = l % 2 === 0 ? 'R' : 'L';
+			// a limb that cannot get to its hold without a part of it in the wall is held off the hold instead (limbPush), never through the wall
 			const end = point(limb.end), bend = limb.bend ? point(limb.bend) : null;
 			this.endAt[l] = end;
 			const flex = new V(0, 0, arm ? 1 : -1);
