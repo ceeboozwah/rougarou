@@ -11,6 +11,8 @@ import { Panel, Route, Vec2, Vec3 } from './sim.js';
 import { solve, withHolds, features } from './grader.js';
 
 export const SEED = 1991;
+// a move the skeleton cannot make is not part of a chunk's solution: the page sets this to the body check's gate (bodycheck.js), node leaves it empty
+export const Gate = { fn: null };
 export const PANEL = 2.5, CHUNK = 4, SPAN = PANEL * CHUNK;
 // where the wall stands (unreal centimeters), facing -x; the room is in front of it
 export const WALL_X = 4400;
@@ -246,7 +248,7 @@ export async function makeChunk(k, wall, hint, log) {
 		let chosen = null;
 		for (const attempt of order) {
 			const holds = repair(middle(k, attempt, wall, li), taken, wall, k);
-			const result = await solve(trial(k, holds, wall), { maxMoves: 140, yieldEvery: 3, finish: reached });
+			const result = await solve(trial(k, holds, wall), { maxMoves: 140, yieldEvery: 3, finish: reached, gate: Gate.fn });
 			log?.(`${li}:${attempt}`, result);
 			if (result.sent) { chosen = { holds, attempt, moves: result.moves }; break; }
 		}
@@ -257,7 +259,7 @@ export async function makeChunk(k, wall, hint, log) {
 				wall.panels.length = Math.min(wall.panels.length, CHUNK * k);
 				wall.grow(CHUNK * (k + 2));
 				const holds = repair(middle(k, 12, wall, li), taken, wall, k);
-				const result = await solve(trial(k, holds, wall), { maxMoves: 140, yieldEvery: 3, finish: reached });
+				const result = await solve(trial(k, holds, wall), { maxMoves: 140, yieldEvery: 3, finish: reached, gate: Gate.fn });
 				log?.(`${li}:flat`, result);
 				if (result.sent) { chosen = { holds, attempt: flat ? 13 : 14, moves: result.moves }; break; }
 			}
@@ -273,7 +275,7 @@ export async function makeChunk(k, wall, hint, log) {
 	const between = [];
 	for (let li = 0; li + 1 < LINES.length; li++) if (lines[li] && lines[li + 1]) between.push(...repair(crosses(k, LINES[li], LINES[li + 1], li), taken.concat(between), wall, k));
 	const all = [...lines.flatMap(l => l ?? []), ...between];
-	const result = await solve(trial(k, all, wall), { maxMoves: 160, yieldEvery: 3, finish: reached });
+	const result = await solve(trial(k, all, wall), { maxMoves: 160, yieldEvery: 3, finish: reached, gate: Gate.fn });
 	log?.('all', result);
 	if (!result.sent) return { holds: [...fixed, ...lines.flatMap(l => l ?? [])], attempt: attempts, moves, sent: true, crossed: false };
 	return { holds: [...fixed, ...all], attempt: attempts, moves: result.moves, sent: true, crossed: true };

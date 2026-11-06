@@ -5,7 +5,7 @@
 
 import * as THREE from 'three';
 import { Vec2, Vec3 } from './sim.js';
-import { toThree } from './gym.js';
+import { toThree, holdInfo } from './gym.js';
 import { Tube, bent } from './tube.js';
 import { Bag } from './chalkbag.js';
 
@@ -472,6 +472,15 @@ export class Climber {
 		// elbows and knees stay out of the wall, so the arms and legs never sink into it
 		posed.limbs.forEach((l, i) => { if (l.bend) l.bend = awayFromWall(face, l.bend, i < 2 ? 11 : 7.5); });
 		// the wall panels around the hips, as plain planes, so the skeleton can keep its knees and elbows out of them (figure.js)
+		// the holds near the body as half-ellipsoids standing on the wall (centimeters), so the skeleton keeps its knees, thighs and trunk out of them
+		posed.holds = [];
+		const near = sim.holds();
+		for (let i = 0; i < near.length; i++) {
+			const spot = near[i];
+			if (spot.carried || Math.abs(spot.point.y - sim.position.y) > 1 || Math.abs(spot.point.x - sim.position.x) > 1) continue;
+			const info = holdInfo(face, spot, spot.chunk ?? sim.route, i);
+			posed.holds.push({ c: info.at, n: info.out, r: Math.sqrt(info.scale.x * info.scale.y) * 1.1, h: info.scale.z * 1.05 });
+		}
 		posed.walls = (face.near ? face.near(pelvis) : face.panels).slice(0, 4).map(p => ({ origin: p.origin, out: p.out, up: p.up, start: p.start, length: p.length }));
 		return posed;
 	}

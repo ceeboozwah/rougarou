@@ -109,6 +109,7 @@ export class Sim {
 		for (const k of ['position', 'velocity', 'lean', 'goal', 'target']) c[k] = this[k].copy();
 		for (const k of ['grips', 'smeared', 'slips', 'pump', 'latch', 'strain', 'loads', 'chalk']) c[k] = [...this[k]];
 		c.sweat = this.sweat;
+		c.gate = this.gate;
 		c.posts = this.posts.map(p => p.copy());
 		c.tips = this.tips.map(p => p.copy());
 		for (const k of ['angle', 'spin', 'won', 'topped', 'reaching', 'squeeze', 'tipping', 'fallen', 'falls', 'hint']) c[k] = this[k];
@@ -195,6 +196,12 @@ export class Sim {
 		}
 		if (!this.open(limb, holds[hold].point)) {
 			this.hint = `${Names[limb]}: the hip will not open that far`;
+			return false;
+		}
+		// the skeleton has the last word (bodycheck.js): a hold the joints cannot reach, or that would push a knee or elbow into the wall, is refused
+		const why = this.gate ? this.gate(this, limb, hold) : null;
+		if (why) {
+			this.hint = `${Names[limb]}: ${why}`;
 			return false;
 		}
 		this.grips[limb] = hold;

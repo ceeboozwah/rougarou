@@ -66,6 +66,13 @@ export class Figure {
 		// how far the whole body may shift (m) to keep the hands and feet on their holds when a joint limit would pull a limb off one
 		this.follow = 0.4;
 		this.psiNow = {};
+		this.endAt = [new V(), new V(), new V(), new V()];
+		this.balls = [];
+		this.openNow = new V();
+		this.openSearch = true;
+		this.openMax = { x: 0.45, y: 0.6, z: 0.35 };
+		this.strict = true;
+		this.weights = { miss: 1, clip: 6, strain: 0.4, open: 3 };
 		this.prevLocal = {};
 		this.ease = false;
 		this.maxTurn = 1;
@@ -132,7 +139,11 @@ export class Figure {
 	}
 
 	// new limits from the pose restriction editor, taking effect at the next frame
-	setMix(mix) { this.mix = { waist: 0.35, spine01: 0.7, neck1: 0.35, neck2: 0.65, ...(mix ?? {}) }; }
+	setMix(mix) {
+		this.mix = { waist: 0.35, spine01: 0.7, neck1: 0.35, neck2: 0.65, ...(mix ?? {}) };
+		// the form lab also trains how much the solver minds turning the pelvis (wopen, of 12) and joints near the end of their range (wstrain, of 2)
+		this.weights = { ...this.weights, open: (mix?.wopen ?? 0.25) * 12, strain: (mix?.wstrain ?? 0.2) * 2 };
+	}
 	setLimits(set) { this.limits = set ?? {}; this.frames = {}; this.hits = {}; }
 
 	// the boxers take the shorts color from the outfit settings
@@ -308,7 +319,8 @@ export class Figure {
 				const n = need.normalize();
 				const h = hereHinge.clone().sub(t1.clone().multiplyScalar(hereHinge.dot(t1))).normalize();
 				const phi = Math.atan2(t1.dot(h.clone().cross(n)), h.dot(n));
-				qU = about(t1, phi * clamp((bend - 0.02) / 0.3, 0, 1)).multiply(qU);
+				const roll = phi * clamp((bend - 0.02) / 0.3, 0, 1);
+				qU = about(t1, roll).multiply(qU);
 			}
 			const carriedLo = qU.clone().multiply(inv(rUp.q));
 			const qL = arc(spin(this.dirOf(lowerName, endName), carriedLo), t2).multiply(carriedLo).multiply(rLo.q);
@@ -318,10 +330,24 @@ export class Figure {
 		const cost = (psi) => {
 			const a = attempt(psi);
 			let c = 0.6 * (psi / Math.PI) ** 2;
-			// the elbow or knee, and the middle of the shin or forearm, must stay out of the wall
-			if (this.walls?.length) {
-				const ankle = a.middle.clone().addScaledVector(a.t2, L2 * 0.5);
-				c += 900 * Math.max(0, clearance - this.wallDepth(a.middle)) ** 2 + 900 * Math.max(0, clearance * 0.6 - this.wallDepth(ankle)) ** 2;
+			// where the elbow or knee really ends up once the shoulder or hip is held to its range (not where it was asked to be), how far the lower bone then
+			// misses its aim, and whether the knee, the middle of the shin or forearm and the thigh are in the wall or a hold
+			if (this.walls?.length || this.balls?.length) {
+				let qc = a.qU;
+				const frameU = this.frames[upperName] ??= jointFrame(this, upperName);
+				if (limU && frameU) {
+					const cl = clampRel(inv(this.rest[upperName].local).multiply(inv(parentQ).multiply(a.qU)), frameU, limU);
+					if (cl.hit) qc = parentQ.clone().multiply(this.rest[upperName].local).multiply(cl.q);
+				}
+				const knee = root.clone().addScaledVector(spin(this.dirOf(upperName, lowerName), qc.clone().multiply(inv(rUp.q))), L1);
+				const shin = knee.clone().lerp(wrist, 0.5);
+				c += 0.6 * (Math.abs(wrist.distanceTo(knee) - L2) * 100) ** 2;
+				const thigh = root.clone().lerp(knee, 0.5);
+				const r1 = clearance * 0.5, r2 = clearance * 0.6;
+				for (const [p, rad, want] of [[knee, clearance * 0.8, clearance], [shin, r2, r2], [thigh, r1, r1]]) {
+					c += 900 * Math.max(0, want - this.wallDepth(p)) ** 2;
+					for (const hold of this.balls) c += 900 * Math.max(0, 0.01 - this.domeClear(p, hold, rad)) ** 2;
+				}
 			}
 			for (const [name, lim, q, parent] of [[upperName, limU, a.qU, parentQ], [lowerName, limL, a.qL, a.qU]]) {
 				if (!lim) continue;
@@ -408,25 +434,47 @@ export class Figure {
 		const smooth = delta > 0 && delta < 0.25, dt = Math.min(delta, 0.05);
 		this.smooth = smooth;
 		this.dt = dt;
-		if (!smooth) { this.psiNow = {}; this.prevLocal = {}; this.shiftNow.set(0, 0, 0); this.stretchNow = 1; }
+		if (!smooth) { this.psiNow = {}; this.prevLocal = {}; this.shiftNow.set(0, 0, 0); this.openNow.set(0, 0, 0); this.stretchNow = 1; }
 		this.maxTurn = Math.max(0.1, 0.25 * dt * 60);
 		this.stretch = 1;
 		this.advance = true;
-		this.#pass(pose, delta, this.shiftNow);
+		this.#pass(pose, delta, this.shiftNow, this.openNow);
 		this.advance = false;
-		if (!this.follow || !Object.keys(base).length) { this.shiftNow.multiplyScalar(0.8); this.prevLocal = {}; return; }
-		let worst = this.#settle(pose, this.shiftNow.clone());
-		let need = 1, target = this.shiftTarget.clone();
-		// a pose the sim asks for that no body could hold (a foot above the hip within a hand's width of it): the joints are stretched past their ranges in steps,
-		// only as far as it takes, rather than leave a foot hanging a meter off its hold. this.stretch says how far it went (1 is within anatomy)
-		for (const k of [1.3, 1.7, 2.5, 4]) {
-			if (worst <= 0.05) break;
-			this.limits = this.stretched(k, base);
-			need = k;
-			worst = this.#settle(pose, target.clone());
-			target = this.shiftTarget.clone();
+		if (!this.follow || !Object.keys(base).length) { this.shiftNow.multiplyScalar(0.8); this.openNow.multiplyScalar(0.8); this.prevLocal = {}; return; }
+		// opening the hips: the pelvis can tip (x), turn (y) and roll (z) a little under the spine, which swings the knees out of the wall, takes a high foot
+		// off the edge of the hip's range and lets a reach go further. a local search from last frame's angles for the least cost (misses, anything of the body in the
+		// wall or a hold, joints near their ends, and a little for the effort of the angle itself), moved toward at a limited speed so the hips do not jerk
+		if (this.openSearch) {
+			let cur = this.openNow.clone(), best = this.#score(pose, this.shiftNow, cur);
+			// in the game it walks a little each frame from where it was; the lab has one go at a pose, so it looks further
+			const steps = smooth ? [0.2, 0.08] : [0.3, 0.3, 0.15, 0.15, 0.07, 0.03];
+			for (const step of steps) for (const axis of ['x', 'y', 'z']) for (const sign of [1, -1]) {
+				const c = cur.clone();
+				c[axis] = clamp(c[axis] + sign * step, -this.openMax[axis], this.openMax[axis]);
+				if (c[axis] === cur[axis]) continue;
+				const s = this.#score(pose, this.shiftNow, c);
+				if (s < best - 1e-6) { best = s; cur = c; }
+			}
+			if (smooth) {
+				const most = 2.5 * dt;
+				for (const axis of ['x', 'y', 'z']) this.openNow[axis] += clamp(cur[axis] - this.openNow[axis], -most, most);
+			} else this.openNow.copy(cur);
 		}
-		this.limits = base;
+		this.#settle(pose, this.shiftNow.clone(), this.openNow);
+		let target = this.shiftTarget.clone();
+		// strict: no joint goes past its range. (a pose that cannot be held within them leaves a limb short of its hold; the old way stretched the ranges)
+		let need = 1;
+		if (!this.strict) {
+			let worst = Math.max(...this.misses);
+			for (const k of [1.3, 1.7, 2.5, 4]) {
+				if (worst <= 0.05) break;
+				this.limits = this.stretched(k, base);
+				need = k;
+				worst = this.#settle(pose, target.clone(), this.openNow);
+				target = this.shiftTarget.clone();
+			}
+			this.limits = base;
+		}
 		if (smooth) {
 			this.shiftNow.lerp(target, 1 - Math.exp(-dt * 12));
 			this.stretchNow += (need - this.stretchNow) * (1 - Math.exp(-dt * (need > this.stretchNow ? 14 : 3)));
@@ -434,9 +482,87 @@ export class Figure {
 		this.stretch = this.stretchNow;
 		if (this.stretchNow > 1.01) this.limits = this.stretched(this.stretchNow, base);
 		this.ease = smooth;
-		this.#pass(pose, 0, this.shiftNow);
+		this.#pass(pose, 0, this.shiftNow, this.openNow);
 		this.ease = false;
 		this.limits = base;
+	}
+
+	// the body is never shifted into the wall: the hips stay at least 10 cm and the shoulders 13 cm clear of it
+	#keepOut(pose, offset) {
+		if (!this.walls?.length) return;
+		for (const [i, j, least] of [[0, 1, 0.1], [2, 3, 0.13]]) {
+			const mid = point(pose.roots[i]).add(point(pose.roots[j])).multiplyScalar(0.5).add(offset);
+			const depth = this.wallDepth(mid);
+			if (depth < least) {
+				const w = this.walls.find(w => { const along = mid.clone().sub(w.o).dot(w.u) + w.start; return along >= w.start - 0.15 && along <= w.start + w.length + 0.15; });
+				if (w) offset.addScaledVector(w.n, least - depth);
+			}
+		}
+	}
+
+	// what a pose on the skeleton costs: limbs off their holds, the body in the wall or a hold, joints near the end of their range, the pelvis turned for nothing
+	#score(pose, offset, open) {
+		this.#pass(pose, 0, offset, open);
+		const w = this.weights;
+		let miss = 0;
+		for (const m of this.misses) miss += (m * 100) ** 2;
+		const clip = this.clipNow();
+		return w.miss * miss + w.clip * clip.sum * 1e4 + w.strain * this.strainNow() + w.open * (open.x * open.x + open.y * open.y + open.z * open.z) * 100;
+	}
+
+	// how far a point of the body (a capsule of Radius round it) is clear of a hold, a half-ellipsoid standing on the wall: positive outside, negative inside
+	domeClear(p, h, radius) {
+		const d = p.clone().sub(h.c), along = d.dot(h.n);
+		if (along < -radius) return 9;
+		const lateral = d.addScaledVector(h.n, -along).length();
+		const q = (lateral / (h.r + radius)) ** 2 + (Math.max(along, 0) / (h.h + radius)) ** 2;
+		return q >= 1 ? 9 : (Math.sqrt(q) - 1) * Math.min(h.h + radius, h.r + radius);
+	}
+
+	// how far the body is in the wall or in a hold: the legs, arms, trunk and head as capsules sampled along their length (their ends are held by a hold on
+	// purpose, so only the insides are tested, and a hold the limb is on or at is skipped). returns the sum of squared depths (m2) and the deepest (m)
+	clipNow() {
+		const P = (n) => { const e = this.bones[n].matrixWorld.elements; return new V(e[12], e[13], e[14]); };
+		let sum = 0, worst = 0;
+		this.clipBy = {};
+		let tag = '';
+		const test = (p, radius, skip) => {
+			let depth = this.wallDepth(p) - radius - 0.01;
+			if (depth < 0) { sum += depth * depth; worst = Math.max(worst, -depth); this.clipBy[tag + ':wall'] = Math.max(this.clipBy[tag + ':wall'] ?? 0, -depth); }
+			for (const h of this.balls) {
+				if (skip && skip.distanceTo(h.c) < h.r + 0.12) continue;
+				depth = this.domeClear(p, h, radius);
+				if (depth < 0) { sum += depth * depth; worst = Math.max(worst, -depth); this.clipBy[tag + ':hold'] = Math.max(this.clipBy[tag + ':hold'] ?? 0, -depth); }
+			}
+		};
+		const along = (a, b, radius, skip) => { for (const t of [0.3, 0.5, 0.7]) test(a.clone().lerp(b, t), radius, skip); };
+		for (const [l, side] of [[0, 'R'], [1, 'L'], [2, 'R'], [3, 'L']]) {
+			const skip = this.endAt[l];
+			if (l < 2) { tag = `${side}thigh`; along(P(`${side}_Thigh`), P(`${side}_Calf`), 0.08, skip); tag = `${side}shin`; along(P(`${side}_Calf`), P(`${side}_Foot`), 0.05, skip); }
+			else { tag = `${side}arm`; along(P(`${side}_Upperarm`), P(`${side}_Forearm`), 0.045, skip); tag = `${side}forearm`; along(P(`${side}_Forearm`), P(`${side}_Hand`), 0.04, skip); }
+		}
+		tag = 'torso';
+		along(P('Hip'), P('Head'), 0.13, null);
+		tag = 'head';
+		test(P('Head'), 0.1, null);
+		return { sum, worst };
+	}
+
+	// joints near the end of their range, from the bones as they stand: (the share of the range past 80%) squared, and the twist the same
+	strainNow() {
+		let s = 0;
+		for (const [name, lim] of Object.entries(this.limits)) {
+			const bone = this.bones[name];
+			if (!bone) continue;
+			const frame = this.frames[name] ??= jointFrame(this, name);
+			if (!frame) continue;
+			const m = measure(inv(this.rest[name].local).multiply(bone.quaternion), frame);
+			const r = m.theta / Math.max(1, reach_(lim, m.phi * Math.PI / 180));
+			const t = m.twist >= 0 ? m.twist / Math.max(1, lim.twist?.[1] ?? 180) : m.twist / Math.min(-1, lim.twist?.[0] ?? -180);
+			if (r > 0.8) s += ((r - 0.8) / 0.2) ** 2;
+			if (t > 0.8) s += ((t - 0.8) / 0.2) ** 2;
+		}
+		return s;
 	}
 
 	// the ranges widened by Factor (the swing and the twist, up to a half turn)
@@ -447,26 +573,29 @@ export class Figure {
 	}
 
 	// the body shifted toward whatever a limit holds short of its hold, a few passes. returns the worst miss left (m)
-	#settle(pose, offset) {
-		this.#pass(pose, 0, offset);
+	#settle(pose, offset, open) {
+		this.#pass(pose, 0, offset, open);
 		for (let pass = 0; pass < 4 && Math.max(...this.misses) > 0.01; pass++) {
 			const step = new V();
 			this.gaps.forEach((g, i) => { if (this.misses[i] > 0.005) step.add(g); });
 			offset.addScaledVector(step, 0.5);
 			if (offset.length() > this.follow) offset.setLength(this.follow);
-			this.#pass(pose, 0, offset);
+			this.#keepOut(pose, offset);
+			this.#pass(pose, 0, offset, open);
 		}
 		this.shiftTarget = offset;
 		return Math.max(...this.misses);
 	}
 
-	#pass(pose, delta, offset) {
+	#pass(pose, delta, offset, open) {
+		this.balls = (pose.holds ?? []).filter(h => h.n && h.h).map(h => ({ c: point(h.c), n: dir(h.n), r: h.r / 100, h: h.h / 100 }));
 		this.walls = (pose.walls ?? []).map(w => ({ o: point(w.origin), n: dir(w.out), u: dir(w.up), start: w.start, length: w.length }));
 		const b = this.bones, rest = this.rest;
 		const [hipR, hipL, shoR, shoL] = pose.roots.map(r => point(r).add(offset));
 		const pelvis = hipR.clone().add(hipL).multiplyScalar(0.5), chest = shoR.clone().add(shoL).multiplyScalar(0.5);
 		const up = chest.clone().sub(pelvis).normalize();
 		const framePelvis = leftUp(hipL.clone().sub(hipR), up);
+		if (open.lengthSq() > 1e-8) framePelvis.multiply(new Q().setFromEuler(new THREE.Euler(open.x, open.y, open.z)));
 		const frameChest = leftUp(shoL.clone().sub(shoR), up);
 		// a body does not hold its back straight: reaching up opens the chest (the thoracic spine extends) and reaching with one arm bends the trunk away from it
 		if (this.posture) {
@@ -494,6 +623,7 @@ export class Figure {
 		for (let l = 0; l < 4; l++) {
 			const limb = pose.limbs[l], arm = l >= 2, side = l % 2 === 0 ? 'R' : 'L';
 			const end = point(limb.end), bend = limb.bend ? point(limb.bend) : null;
+			this.endAt[l] = end;
 			const flex = new V(0, 0, arm ? 1 : -1);
 			const roots = arm ? [shoR, shoL][l - 2] : [hipR, hipL][l];
 			const mid = roots.clone().add(end).multiplyScalar(0.5);

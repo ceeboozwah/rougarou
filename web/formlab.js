@@ -18,8 +18,8 @@ const D2R = Math.PI / 180;
 const Key = 'rougarou-formlab';
 const COMFORT = 0.7;
 const HIT = 0.015;
-const MIXES = ['waist', 'spine01', 'neck1', 'neck2'];
-const DEFAULT = { waist: 0.35, spine01: 0.7, neck1: 0.35, neck2: 0.65 };
+const MIXES = ['waist', 'spine01', 'neck1', 'neck2', 'wopen', 'wstrain'];
+const DEFAULT = { waist: 0.35, spine01: 0.7, neck1: 0.35, neck2: 0.65, wopen: 0.25, wstrain: 0.2 };
 const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); for (const k of kids) e.append(k); return e; };
 const round = (v) => Math.round(v);
 const pct = (list, p) => { if (!list.length) return 0; const s = [...list].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
@@ -27,8 +27,12 @@ const rng = (seed) => { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) 
 const gauss = (r) => Math.sqrt(-2 * Math.log(1 - r())) * Math.cos(2 * Math.PI * r());
 
 export class FormLab {
-	constructor({ toast, onApply, collect }) {
-		Object.assign(this, { toast, onApply, collect });
+	constructor({ toast, onApply, collect, scene, prepare }) {
+		Object.assign(this, { toast, onApply, collect, scene, prepare });
+		this.watching = false;
+		this.live = null;
+		this.lastShown = -1;
+		this.nextAt = 0;
 		this.active = false;
 		this.ready = false;
 		this.poses = [];
@@ -55,8 +59,9 @@ export class FormLab {
 
 	// ---------------------------------------------------------------- replaying a pose
 	// the pose on the skeleton under Limits and Mix; returns how far each limb missed (m), the joint turns, and the strain
-	replay(pose, limits, mix) {
+	replay(pose, limits, mix, opts = {}) {
 		const f = this.figure;
+		f.openSearch = opts.open ?? true;
 		f.limits = limits ?? {};
 		f.hits = {};
 		f.setMix(mix);
@@ -77,18 +82,22 @@ export class FormLab {
 		}
 		const sp = ['Waist', 'Spine01', 'Spine02'].map(n => turns[n].theta), mean = (sp[0] + sp[1] + sp[2]) / 3;
 		strain += 0.5 * (sp.reduce((s, v) => s + (v - mean) ** 2, 0) / 3) / 64;
-		// a knee or an elbow inside the wall (less than 2 cm clear of it)
-		let clip = false;
-		for (const n of ['R_Calf', 'L_Calf', 'R_Forearm', 'L_Forearm']) { const e = f.bones[n].matrixWorld.elements; if (f.wallDepth(new Vector3(e[12], e[13], e[14])) < 0.02) clip = true; }
-		return { miss: [...f.misses], turns, strain, hits: { ...f.hits }, stretch: f.stretch, clip };
+		// any part of the body (thighs, shins, arms, trunk, head) inside the wall or a hold, by more than a centimeter past the margin
+		const c = f.clipNow();
+		let twistOver = 0;
+		for (const n of this.names) { const lim = this.anatomy[n]; const t = turns[n].twist; twistOver = Math.max(twistOver, t > 0 ? t - lim.twist[1] : lim.twist[0] - t); }
+		return { miss: [...f.misses], turns, strain, hits: { ...f.hits }, stretch: f.stretch, clip: c.worst > 0.01, clipDepth: c.worst, twistOver, open: f.openNow.toArray() };
 	}
 
 	// every pose under one setting: how many limbs land on their holds, how far they miss, how strained the body is, which joints ran into a wall
-	study(limits, mix, poses = this.poses) {
+	study(limits, mix, poses = this.poses, opts = {}) {
 		const misses = [], strains = [], held = {};
-		let every = 0, knee = 0, elbow = 0, stretched = 0, clips = 0;
+		let every = 0, knee = 0, elbow = 0, stretched = 0, clips = 0, deepest = 0, twistOver = 0, opened = 0;
 		for (const { pose } of poses) {
-			const r = this.replay(pose, limits, mix);
+			const r = this.replay(pose, limits, mix, opts);
+			deepest = Math.max(deepest, r.clipDepth);
+			twistOver = Math.max(twistOver, r.twistOver);
+			if (Math.hypot(...r.open) > 0.1) opened++;
 			misses.push(...r.miss);
 			strains.push(r.strain);
 			if (r.miss.every(m => m < HIT)) every++;
@@ -106,7 +115,7 @@ export class FormLab {
 			worst: Math.max(0, ...misses) * 100,
 			strain: strains.reduce((a, b) => a + b, 0) / n,
 			held: Object.fromEntries(Object.entries(held).map(([k, v]) => [k, v / n])),
-			knee, elbow, stretched: stretched / n, clip: clips / n,
+			knee, elbow, stretched: stretched / n, clip: clips / n, deepest: deepest * 100, twistOver, opened: opened / n,
 		};
 	}
 
@@ -138,11 +147,13 @@ export class FormLab {
 		this.needs = this.demand();
 		const sample = [...this.poses].sort(() => rand() - 0.5).slice(0, 70);
 		// how a split does: misses of the holds (in cm, squared) plus strain, under the anatomical ranges
-		const score = (m) => { const s = this.study(this.anatomy, m, sample); return (s.miss / 1.5) ** 2 + s.worst / 6 + 6 * s.stretched + 12 * s.clip + 0.35 * s.strain; };
-		let mean = MIXES.map(k => DEFAULT[k]), sigma = MIXES.map(() => 0.22);
+		const score = (m) => { const s = this.study(this.anatomy, m, sample); return (s.miss / 1.5) ** 2 + s.worst / 6 + 14 * s.clip + s.deepest / 2 + 0.35 * s.strain; };
+		let mean = MIXES.map(k => DEFAULT[k]), sigma = MIXES.map(k => k.startsWith('w') && k.length > 4 ? 0.12 : 0.22);
 		const toMix = (v) => Object.fromEntries(MIXES.map((k, i) => [k, Math.min(1, Math.max(0, v[i]))]));
 		let best = { v: mean.slice(), cost: score(DEFAULT) };
 		this.curve = [best.cost];
+		this.live = { ...DEFAULT };
+		this.liveCost = best.cost;
 		const pop = 14, elite = 4;
 		for (let g = 0; g < gens; g++) {
 			const crowd = [];
@@ -154,21 +165,32 @@ export class FormLab {
 			}
 			crowd.sort((a, b) => a.cost - b.cost);
 			if (crowd[0].cost < best.cost) best = { v: crowd[0].v.slice(), cost: crowd[0].cost };
+			this.live = toMix(best.v);
+			this.liveCost = best.cost;
 			const top = crowd.slice(0, elite);
 			mean = mean.map((m, i) => 0.4 * m + 0.6 * top.reduce((s, c) => s + c.v[i], 0) / elite);
 			sigma = sigma.map((s, i) => Math.max(0.03, 0.5 * s + 0.5 * Math.sqrt(top.reduce((a, c) => a + (c.v[i] - mean[i]) ** 2, 0) / elite)));
 			this.curve.push(best.cost);
 		}
 		this.mix = toMix(best.v);
+		this.live = this.mix;
 		this.progress = 'testing every wall pose under each setting';
 		yield;
-		const free = this.study(null, DEFAULT), file = this.study(this.file, DEFAULT), anat = this.study(this.anatomy, DEFAULT), trained = this.study(this.anatomy, this.mix);
-		this.report = [['no limits', free], ['limits.json as it was', file], ['anatomical ranges', anat], ['ranges + trained spine', trained]].map(([name, s]) => ({ name, ...s }));
+		const free = this.study(null, DEFAULT), fixed = this.study(this.anatomy, DEFAULT, this.poses, { open: false }), opened = this.study(this.anatomy, DEFAULT), trained = this.study(this.anatomy, this.mix);
+		this.report = [['no limits', free], ['strict limits, hips fixed', fixed], ['strict limits, hips open', opened], ['+ trained weights and spine', trained]].map(([name, s]) => ({ name, ...s }));
 		this.persist();
 	}
 
-	go() {
+	async go() {
 		if (!this.poses.length) { this.toast?.('climb the wall and take poses first', 'warn'); return; }
+		this.watch(true);
+		// the wall behind the poses has to exist before there is anything to watch against: draw as much of it as the poses reach
+		if (this.prepare) {
+			this.progress = 'drawing the wall behind the poses...';
+			this.busy = true;
+			this.draw();
+			try { await this.prepare(Math.max(10, ...this.poses.map(p => p.y))); } finally { this.busy = false; }
+		}
 		this.run(this.job(Number(this.genSel.value)));
 	}
 
@@ -214,13 +236,14 @@ export class FormLab {
 	// ---------------------------------------------------------------- applying
 	ask() {
 		if (!this.mix) return;
-		if (!this.armed) { this.armed = true; this.applyBtn.textContent = 'really replace limits.json?'; setTimeout(() => { this.armed = false; this.applyBtn.textContent = 'apply ranges + trained spine'; }, 5000); return; }
+		if (!this.armed) { this.armed = true; this.applyBtn.textContent = 'really replace limits.json?'; setTimeout(() => { this.armed = false; this.applyBtn.textContent = 'apply trained weights + spine'; }, 5000); return; }
 		this.armed = false;
-		this.applyBtn.textContent = 'apply ranges + trained spine';
+		this.applyBtn.textContent = 'apply trained weights + spine';
 		this.apply();
 	}
 	async apply() {
-		const set = JSON.parse(JSON.stringify(this.anatomy)), mix = { ...this.mix };
+		// the limits are the user's (the pose editor wrote them); only the trained weights and the spine split are written
+		const set = JSON.parse(JSON.stringify(Object.keys(this.file).length ? this.file : this.anatomy)), mix = { ...this.mix };
 		this.onApply?.(set, mix);
 		this.file = set;
 		try {
@@ -230,6 +253,38 @@ export class FormLab {
 			const ok = JSON.stringify(back) === JSON.stringify(set) && JSON.stringify(m) === JSON.stringify(mix);
 			this.toast?.(ok ? 'anatomical limits and the trained spine saved to limits.json and checked' : 'saved, but the file read back differently', ok ? 'good' : 'warn');
 		} catch (e) { this.toast?.(`on the characters for now; not written to limits.json (${e.message})`, 'warn'); }
+	}
+
+	// ---------------------------------------------------------------- watching it train, in the game
+	// the lab's own skeleton goes into the game's scene and poses the wall poses it is training on, one every second or so, under the weights the training
+	// has found best so far, so the body can be seen getting better; the lab panel shrinks to a corner and the game's camera circles the climber
+	watch(on) {
+		if (on === this.watching || !this.ready) return;
+		this.watching = on;
+		// the wall behind the poses has to exist: draw as much of it as the poses reach
+		this.root.classList.toggle('mini', on);
+		if (this.scene) { if (on) this.scene.add(this.figure.root); else this.scene.remove(this.figure.root); }
+		this.lastShown = -1;
+		if (this.watchBtn) this.watchBtn.textContent = on ? 'show the full lab' : 'watch in the game';
+	}
+
+	// called by the game each frame while watching: poses the skeleton and returns where the camera and the wall's meshes should be
+	view(seconds) {
+		if (!this.watching || !this.poses.length) return null;
+		if (seconds >= this.nextAt) {
+			this.shown = this.busy ? (this.shown + 1 + Math.floor(Math.random() * 6)) % this.poses.length : this.shown;
+			this.nextAt = seconds + (this.busy ? 1.1 : 1e9);
+		}
+		const entry = this.poses[this.shown];
+		const r = this.replay(entry.pose, this.anatomy, this.live ?? this.mix ?? DEFAULT, { open: true });
+		const f = this.figure;
+		const p = new Vector3().setFromMatrixPosition(f.bones.Hip.matrixWorld);
+		const n = f.walls[0]?.n.clone() ?? new Vector3(0, 0, -1);
+		const side = new Vector3().crossVectors(n, new Vector3(0, 1, 0)).normalize();
+		const swing = Math.sin(seconds * 0.25) * 1.3;
+		const pos = p.clone().addScaledVector(n, 3.1).addScaledVector(side, swing).add(new Vector3(0, 0.35, 0));
+		this.status.textContent = `${this.progress ?? ''} · pose ${this.shown + 1} of ${this.poses.length}, ${entry.y.toFixed(1)} m up · on hold ${r.miss.filter(m => m < HIT).length} of 4 limbs${r.clip ? ' · body in the wall' : ''}`;
+		return { pos, target: p.clone().add(new Vector3(0, 0.1, 0)), wallY: entry.y, key: this.shown, out: n };
 	}
 
 	// ---------------------------------------------------------------- the window
@@ -250,6 +305,9 @@ export class FormLab {
 #formlab th:first-child,#formlab td:first-child{text-align:left}
 #formlab .good{color:#6fcf8c}#formlab .bad{color:#e0594a}
 #formlab input[type=range]{width:100%}
+#formlab.mini{inset:auto 12px 12px auto;width:440px;max-height:62vh;grid-template-columns:1fr;background:rgba(14,15,18,.86);border-radius:14px;pointer-events:auto}
+#formlab.mini canvas{display:none}
+#formlab.mini .intro{display:none}
 ` }));
 		this.root = el('div', { id: 'formlab', hidden: true });
 		const left = el('div'), right = el('div');
@@ -260,7 +318,7 @@ export class FormLab {
 		this.genSel.value = 14;
 		this.gatherBtn = el('button', { className: 'main', textContent: 'climb the wall and take poses', onclick: () => this.gather() });
 		this.trainBtn = el('button', { className: 'main', textContent: 'train and test', onclick: () => this.go() });
-		this.applyBtn = el('button', { textContent: 'apply ranges + trained spine', onclick: () => this.ask() });
+		this.applyBtn = el('button', { textContent: 'apply trained weights + spine', onclick: () => this.ask() });
 		this.status = el('p');
 		this.front = el('canvas', { width: 380, height: 300 });
 		this.slider = el('input', { type: 'range', min: 0, max: 0, value: 0, oninput: () => { this.shown = Number(this.slider.value); this.draw(); } });
@@ -268,10 +326,10 @@ export class FormLab {
 		this.out = el('div');
 		left.append(
 			el('h2', { textContent: 'form lab' }),
-			el('p', { textContent: 'trains on realistic bending, flexion and rotation, on the wall itself. the AI climbs the endless wall, every joint obeys anatomical ranges from the biomechanics literature, and it learns how the spine and neck should share a turn so the hands and feet stay on their holds and the body stays relaxed.' }),
+			el('p', { className: 'intro', textContent: 'trains on realistic bending, flexion and rotation, on the wall itself. the AI climbs the endless wall, every joint obeys anatomical ranges from the biomechanics literature, and it learns how the spine and neck should share a turn so the hands and feet stay on their holds and the body stays relaxed.' }),
 			el('div', { className: 'row' }, this.chunkSel, this.gatherBtn),
 			el('div', { className: 'row' }, this.genSel, this.trainBtn),
-			el('div', { className: 'row' }, this.applyBtn, el('button', { textContent: 'pause / go', onclick: () => { this.pause = !this.pause; } }), el('button', { textContent: 'close', onclick: () => this.close() })),
+			el('div', { className: 'row' }, this.applyBtn, this.watchBtn = el('button', { textContent: 'watch in the game', onclick: () => this.watch(!this.watching) }), el('button', { textContent: 'pause / go', onclick: () => { this.pause = !this.pause; } }), el('button', { textContent: 'close', onclick: () => this.close() })),
 			this.status, this.front, this.slider,
 			el('small', { textContent: 'a pose off the wall, front and side: white is the body under the anatomical ranges, grey the same pose with no limits at all. drag to step through the poses.' }),
 			this.curveBox, el('small', { textContent: 'the training cost of the best spine split, by generation (lower is better).' }),
@@ -284,12 +342,15 @@ export class FormLab {
 	async open() {
 		if (!this.ready) { this.toast?.('form lab: loading the skeleton', 'good'); await this.build(); }
 		this.file = await loadLimits();
+		// the ranges it trains against are the ones in limits.json (set in the pose restriction editor); the textbook ones only fill in joints the file does not mention
+		this.anatomy = { ...humanDefaults(), ...JSON.parse(JSON.stringify(this.file)) };
+		this.names = Editable.filter(n => this.anatomy[n] && humanDefaults()[n]);
 		this.slider.max = Math.max(0, this.poses.length - 1);
 		this.active = true;
 		this.root.hidden = false;
 		this.draw();
 	}
-	close() { this.active = false; this.root.hidden = true; this.pause = false; }
+	close() { this.watch(false); this.active = false; this.root.hidden = true; this.pause = false; }
 
 	// the lines of the body now on the skeleton
 	lines() {
@@ -336,11 +397,11 @@ export class FormLab {
 		}
 		this.out.replaceChildren();
 		if (this.report) {
-			const t = el('table'); t.append(el('tr', {}, ...['on the wall poses', 'on hold', 'every limb', 'miss cm', 'worst cm', 'past range', 'in wall', 'strain', 'knee°', 'elbow°'].map(h => el('th', { textContent: h }))));
+			const t = el('table'); t.append(el('tr', {}, ...['on the wall poses', 'on hold', 'every limb', 'miss cm', 'worst cm', 'body in wall', 'deepest cm', 'hips opened', 'strain', 'knee°', 'elbow°'].map(h => el('th', { textContent: h }))));
 			const bestStrain = Math.min(...this.report.slice(1).map(r => r.strain));
-			for (const r of this.report) t.append(el('tr', {}, el('td', { textContent: r.name }), el('td', { textContent: `${round(r.reach * 100)}%` }), el('td', { textContent: `${round(r.every * 100)}%` }), el('td', { textContent: r.miss.toFixed(2) }), el('td', { textContent: r.worst.toFixed(1) }), el('td', { textContent: `${round(r.stretched * 100)}%` }), el('td', { className: r.clip > 0.02 ? 'bad' : 'good', textContent: `${round(r.clip * 100)}%` }), el('td', { className: r.strain === bestStrain ? 'good' : '', textContent: r.strain.toFixed(2) }), el('td', { textContent: round(r.knee) }), el('td', { textContent: round(r.elbow) })));
-			this.out.append(el('h2', { textContent: 'how it performed' }), t, el('small', { textContent: 'on hold: limbs that land within 1.5 cm of where the climber aimed. in wall: poses where a knee or elbow is less than 2 cm clear of the wall. every limb: poses where all four do. past range: poses where the sim asked for a reach no body can make within the ranges, so the joints were stretched just far enough to keep the hold. knee and elbow: the most they folded, in degrees (a person folds a knee 135-155 and an elbow 145-150).' }));
-			if (this.mix) this.out.append(el('p', { textContent: `trained split: the waist takes ${round(this.mix.waist * 100)}% and the mid spine ${round(this.mix.spine01 * 100)}% of the turn from pelvis to chest; the lower neck ${round(this.mix.neck1 * 100)}% and the mid neck ${round(this.mix.neck2 * 100)}% of the turn from chest to face (it was 35, 70, 35, 65).` }));
+			for (const r of this.report) t.append(el('tr', {}, el('td', { textContent: r.name }), el('td', { textContent: `${round(r.reach * 100)}%` }), el('td', { textContent: `${round(r.every * 100)}%` }), el('td', { textContent: r.miss.toFixed(2) }), el('td', { textContent: r.worst.toFixed(1) }), el('td', { className: r.clip > 0.1 ? 'bad' : 'good', textContent: `${round(r.clip * 100)}%` }), el('td', { textContent: r.deepest.toFixed(1) }), el('td', { textContent: `${round(r.opened * 100)}%` }), el('td', { className: r.strain === bestStrain ? 'good' : '', textContent: r.strain.toFixed(2) }), el('td', { textContent: round(r.knee) }), el('td', { textContent: round(r.elbow) })));
+			this.out.append(el('h2', { textContent: 'how it performed' }), t, el('small', { textContent: 'on hold: limbs that land within 1.5 cm of where the climber aimed. body in wall: poses where any part of the body (thighs, shins, arms, trunk, head) is more than a centimeter into the wall or a hold, and the deepest it goes. hips opened: poses where the pelvis was turned to get a limb out of the wall or onto its hold. every limb: poses where all four do. knee and elbow: the most they folded, in degrees (a person folds a knee 135-155 and an elbow 145-150).' }));
+			if (this.mix) this.out.append(el('p', { textContent: `trained split: the waist takes ${round(this.mix.waist * 100)}% and the mid spine ${round(this.mix.spine01 * 100)}% of the turn from pelvis to chest; the lower neck ${round(this.mix.neck1 * 100)}% and the mid neck ${round(this.mix.neck2 * 100)}% of the turn from chest to face (it was 35, 70, 35, 65); the solver's cost for turning the pelvis is ${((this.mix.wopen ?? 0.25) * 12).toFixed(1)} and for strained joints ${((this.mix.wstrain ?? 0.2) * 2).toFixed(2)}.` }));
 		}
 		if (this.needs) {
 			const t = el('table'); t.append(el('tr', {}, ...['joint', 'front', 'back', 'out', 'in', 'twist'].map(h => el('th', { textContent: h }))));

@@ -57,7 +57,9 @@ export function jointFrame(figure, name) {
 	const S = new V().crossVectors(T, F).normalize();
 	const side = name.startsWith('L_') ? -1 : 1;
 	const to_local = (v) => spin(v, inv(rest.q));
-	return { T: to_local(T), F: to_local(F), S: to_local(S.multiplyScalar(side)), side, name };
+	// the hip and the shoulder swing a long way, so their axial rotation is measured the way anatomy defines it (flexion first, then the swing out, then the turn about
+	// the bone) and not as what is left once the shortest swing is taken off, which reads a frog step or an arm raised overhead as 50 degrees of twist that no joint made
+	return { T: to_local(T), F: to_local(F), S: to_local(S.multiplyScalar(side)), side, name, euler: /(Thigh|Upperarm)$/.test(name) };
 }
 
 // how a joint is limited: a cone for the swing and a range for the twist, all in degrees from rest.
@@ -68,6 +70,15 @@ export function jointFrame(figure, name) {
 const arc = (a, b) => new Q().setFromUnitVectors(a, b);
 const bearing = (frame) => ({ D: new V().crossVectors(frame.F, frame.T).normalize(), E: new V().crossVectors(frame.S, frame.T).normalize() });
 
+// the turn that takes the bone from rest to pointing at T2 the anatomical way: flexion about F, then the shortest swing on to T2 (no turn about the bone yet)
+function eulerPath(frame, T2) {
+	const D = new V().crossVectors(frame.F, frame.T).normalize();
+	const alpha = Math.atan2(T2.dot(D), T2.dot(frame.T));
+	const q1 = new Q().setFromAxisAngle(frame.F, alpha);
+	const T1 = frame.T.clone().multiplyScalar(Math.cos(alpha)).addScaledVector(D, Math.sin(alpha)).normalize();
+	return arc(T1, T2).multiply(q1);
+}
+
 // where a turn from rest points the bone (an angle away from rest and the direction around it, 0 toward the front and 90 away from the body), and the twist
 export function measure(rel, frame) {
 	const q = rel.clone().normalize();
@@ -76,7 +87,7 @@ export function measure(rel, frame) {
 	const theta = Math.acos(Math.min(1, Math.max(-1, T2.dot(frame.T))));
 	const phi = Math.atan2(T2.dot(E), T2.dot(D));
 	// what is left once the swing has been taken off is a turn about the bone
-	const rest = arc(frame.T, T2).invert().multiply(q);
+	const rest = (frame.euler ? eulerPath(frame, T2) : arc(frame.T, T2)).invert().multiply(q);
 	let twist = 2 * Math.atan2(rest.x * frame.T.x + rest.y * frame.T.y + rest.z * frame.T.z, rest.w);
 	if (twist > Math.PI) twist -= 2 * Math.PI;
 	if (twist < -Math.PI) twist += 2 * Math.PI;
@@ -101,7 +112,7 @@ export function clampRel(rel, frame, lim) {
 	if (m.theta <= most + 1e-6 && twist === m.twist) return { q: rel, hit: false, values: m };
 	const theta = Math.min(m.theta, most) / DEG;
 	const T2 = frame.T.clone().multiplyScalar(Math.cos(theta)).addScaledVector(D, Math.sin(theta) * Math.cos(phi)).addScaledVector(E, Math.sin(theta) * Math.sin(phi)).normalize();
-	return { q: arc(frame.T, T2).multiply(new Q().setFromAxisAngle(frame.T, twist / frame.side / DEG)), hit: true, values: m };
+	return { q: (frame.euler ? eulerPath(frame, T2) : arc(frame.T, T2)).multiply(new Q().setFromAxisAngle(frame.T, twist / frame.side / DEG)), hit: true, values: m };
 }
 
 // the anatomical ranges of a person, joint by joint: the hard walls the characters obey. they are measured from THIS skeleton's rest pose (the arms rest in an

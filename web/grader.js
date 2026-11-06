@@ -26,8 +26,9 @@ export function startsHold(route) {
 }
 
 // climb it with rehearsal, from the start holds, as far as it goes. Resolves { sent, moves, trace, stuck }
-export async function solve(route, { maxMoves = 32, yieldEvery = 1, finish, observe } = {}) {
+export async function solve(route, { maxMoves = 32, yieldEvery = 1, finish, observe, gate } = {}) {
 	const sim = new Sim([route]);
+	sim.gate = gate ?? null;
 	sim.restart();
 	const trace = [];
 	const recent = [];
